@@ -192,6 +192,38 @@ fn client_mainloop(
             }
         }
 
+        // Keyboard input — check FIRST so detach key is never starved
+        // by server output
+        if pollfds[0].revents().contains(PollFlags::IN) && !in_replay {
+            let n = match protocol::try_read(stdin.as_fd(), &mut read_buf) {
+                Ok(0) => 0, // would block
+                Ok(n) => n,
+                Err(_) => return Ok(AttachResult::Detached), // stdin closed
+            };
+
+            if n > 0 {
+                // Check for detach key anywhere in the input
+                if let Some(pos) = read_buf[..n].iter().position(|&b| b == detach_key) {
+                    // Send any bytes before the detach key
+                    if pos > 0 && !flags.contains(ClientFlags::READONLY) {
+                        let pkt = Packet::content(&read_buf[..pos]);
+                        let _ = protocol::send_packet(stream.as_fd(), &pkt);
+                    }
+                    let pkt = Packet::empty(MsgType::Detach);
+                    let _ = protocol::send_packet(stream.as_fd(), &pkt);
+                    return Ok(AttachResult::Detached);
+                }
+
+                // Send to server (if not readonly)
+                if !flags.contains(ClientFlags::READONLY) {
+                    let pkt = Packet::content(&read_buf[..n]);
+                    if protocol::send_packet(stream.as_fd(), &pkt).is_err() {
+                        return Ok(AttachResult::IoError);
+                    }
+                }
+            }
+        }
+
         // Data from server
         if pollfds[1].revents().intersects(PollFlags::IN | PollFlags::HUP) {
             let n = match protocol::try_read(stream.as_fd(), &mut read_buf) {
@@ -229,35 +261,6 @@ fn client_mainloop(
                         return Ok(AttachResult::IoError);
                     }
                     _ => {} // ignore unexpected
-                }
-            }
-        }
-
-        // Keyboard input
-        if pollfds[0].revents().contains(PollFlags::IN) && !in_replay {
-            let n = match protocol::try_read(stdin.as_fd(), &mut read_buf) {
-                Ok(0) => continue,
-                Ok(n) => n,
-                Err(_) => return Ok(AttachResult::Detached), // stdin closed
-            };
-
-            // Check for detach key anywhere in the input
-            if let Some(pos) = read_buf[..n].iter().position(|&b| b == detach_key) {
-                // Send any bytes before the detach key
-                if pos > 0 && !flags.contains(ClientFlags::READONLY) {
-                    let pkt = Packet::content(&read_buf[..pos]);
-                    let _ = protocol::send_packet(stream.as_fd(), &pkt);
-                }
-                let pkt = Packet::empty(MsgType::Detach);
-                let _ = protocol::send_packet(stream.as_fd(), &pkt);
-                return Ok(AttachResult::Detached);
-            }
-
-            // Send to server (if not readonly)
-            if !flags.contains(ClientFlags::READONLY) {
-                let pkt = Packet::content(&read_buf[..n]);
-                if protocol::send_packet(stream.as_fd(), &pkt).is_err() {
-                    return Ok(AttachResult::IoError);
                 }
             }
         }
