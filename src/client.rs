@@ -132,6 +132,17 @@ impl Drop for RawTerminal {
             rustix::termios::OptionalActions::Flush,
             &self.orig,
         );
+        // Reset terminal modes that TUI apps may have enabled via escape
+        // sequences (these aren't covered by termios restore):
+        //   - Kitty keyboard protocol: pop mode
+        //   - Alternate screen: exit
+        //   - Bracketed paste: disable
+        //   - Mouse reporting: disable all common modes
+        let stdout = io::stdout();
+        let _ = protocol::write_all_fd(
+            stdout.as_fd(),
+            b"\x1b[<u\x1b[?1049l\x1b[?2004l\x1b[?1000l\x1b[?1006l",
+        );
     }
 }
 
