@@ -1,73 +1,184 @@
 //! Integration tests for the mn binary.
 //!
-//! Each test spawns real server processes and interacts with them through
-//! the CLI, verifying the full create → attach → replay → detach lifecycle.
+//! Each test gets an isolated socket directory (via MNEME_SOCKET_DIR) in a
+//! temp dir, so tests can run in parallel without interfering with each
+//! other or the user's real sessions.
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::os::fd::AsFd;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
+
+use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
 // Test harness
 // ---------------------------------------------------------------------------
 
-fn mn() -> PathBuf {
+fn mn_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_mn"))
 }
 
-/// Run `mn` with args, capture stdout+stderr, with a timeout.
-fn mn_run(args: &[&str], timeout_secs: u64) -> CmdResult {
-    mn_run_with_stdin(args, None, timeout_secs)
+static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+/// Isolated test environment with its own socket directory.
+/// On drop, kills all server processes and removes the dir.
+struct TestEnv {
+    dir: TempDir,
 }
 
-/// Run `mn` with args and optional stdin, capture stdout+stderr.
-fn mn_run_with_stdin(args: &[&str], stdin_bytes: Option<&[u8]>, timeout_secs: u64) -> CmdResult {
-    let mut cmd = Command::new(mn());
-    cmd.args(args)
-        .stdin(if stdin_bytes.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    let mut child = cmd.spawn().expect("failed to spawn mn");
-
-    if let Some(input) = stdin_bytes {
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(input).ok();
-            drop(stdin); // close stdin so the process sees EOF
+impl TestEnv {
+    fn new() -> Self {
+        Self {
+            dir: TempDir::new().expect("failed to create temp dir"),
         }
     }
 
-    let output = wait_with_timeout(&mut child, Duration::from_secs(timeout_secs));
-    match output {
-        Some(out) => CmdResult {
-            code: out.status.code().unwrap_or(-1),
-            stdout: String::from_utf8_lossy(&out.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
-        },
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
-            CmdResult {
-                code: -1,
-                stdout: String::new(),
-                stderr: "TIMEOUT".into(),
+    /// Path to the socket directory.
+    fn socket_dir(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// Generate a unique session name (includes PID + counter for uniqueness).
+    fn session(&self, prefix: &str) -> String {
+        let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{prefix}-{}-{n}", std::process::id())
+    }
+
+    /// Build a Command for mn with MNEME_SOCKET_DIR set to our temp dir.
+    fn cmd(&self) -> Command {
+        let mut cmd = Command::new(mn_bin());
+        cmd.env("MNEME_SOCKET_DIR", self.socket_dir());
+        cmd
+    }
+
+    /// Run mn synchronously, capture output, enforce timeout.
+    fn run(&self, args: &[&str], timeout_secs: u64) -> CmdResult {
+        self.run_with_stdin(args, None, timeout_secs)
+    }
+
+    /// Run mn with optional stdin bytes, capture output.
+    fn run_with_stdin(
+        &self,
+        args: &[&str],
+        stdin_bytes: Option<&[u8]>,
+        timeout_secs: u64,
+    ) -> CmdResult {
+        let mut cmd = self.cmd();
+        cmd.args(args)
+            .stdin(if stdin_bytes.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().expect("failed to spawn mn");
+
+        if let Some(input) = stdin_bytes {
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(input).ok();
+                drop(stdin);
             }
         }
+
+        collect_output(&mut child, Duration::from_secs(timeout_secs))
+    }
+
+    /// Spawn mn as a background process (for interactive tests).
+    fn spawn(&self, args: &[&str]) -> Child {
+        self.cmd()
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn mn")
+    }
+
+    /// Query a session's server PID by connecting to its socket.
+    fn server_pid(&self, session: &str) -> Option<u32> {
+        let path = self.socket_dir().join(session);
+        let stream = UnixStream::connect(&path).ok()?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .ok()?;
+
+        // Send a Query Hello
+        let hello = mneme::protocol::Hello {
+            version: mneme::protocol::PROTOCOL_VERSION,
+            intent: mneme::protocol::Intent::Query,
+            flags: mneme::protocol::ClientFlags::empty(),
+            rows: 0,
+            cols: 0,
+        };
+        mneme::protocol::send_packet(
+            stream.as_fd(),
+            &mneme::protocol::Packet::hello(&hello),
+        )
+        .ok()?;
+
+        let pkt = mneme::protocol::recv_packet(stream.as_fd()).ok()?;
+        let welcome = pkt.parse_welcome()?;
+        Some(welcome.server_pid)
+    }
+
+    /// Kill all servers with sockets in our directory.
+    fn kill_all_servers(&self) {
+        // Discover current PIDs
+        let entries = match std::fs::read_dir(self.socket_dir()) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let mut pids = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(pid) = self.server_pid(&name) {
+                pids.push(pid);
+            }
+        }
+        if pids.is_empty() {
+            return;
+        }
+        // SIGKILL everything immediately — no graceful shutdown in tests
+        for &pid in &pids {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+        // Wait for them to die
+        let start = std::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            let any_alive = pids.iter().any(|&pid| unsafe {
+                libc::kill(pid as libc::pid_t, 0) == 0
+            });
+            if !any_alive {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
-/// Wait for a child process with timeout. Returns None on timeout.
-fn wait_with_timeout(
-    child: &mut std::process::Child,
-    timeout: Duration,
-) -> Option<std::process::Output> {
-    use std::thread;
+impl Drop for TestEnv {
+    fn drop(&mut self) {
+        self.kill_all_servers();
+    }
+}
 
+/// Collected output from a command.
+struct CmdResult {
+    code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+/// Wait for a child to exit, with timeout. Kills on timeout.
+fn collect_output(child: &mut Child, timeout: Duration) -> CmdResult {
     let start = std::time::Instant::now();
     let poll_interval = Duration::from_millis(50);
 
@@ -82,63 +193,36 @@ fn wait_with_timeout(
                 if let Some(mut err) = child.stderr.take() {
                     err.read_to_end(&mut stderr).ok();
                 }
-                return Some(std::process::Output {
-                    status,
-                    stdout,
-                    stderr,
-                });
+                return CmdResult {
+                    code: status.code().unwrap_or(-1),
+                    stdout: String::from_utf8_lossy(&stdout).to_string(),
+                    stderr: String::from_utf8_lossy(&stderr).to_string(),
+                };
             }
             Ok(None) => {
                 if start.elapsed() > timeout {
-                    return None;
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return CmdResult {
+                        code: -1,
+                        stdout: String::new(),
+                        stderr: "TIMEOUT".into(),
+                    };
                 }
-                thread::sleep(poll_interval);
+                std::thread::sleep(poll_interval);
             }
-            Err(_) => return None,
+            Err(_) => {
+                return CmdResult {
+                    code: -1,
+                    stdout: String::new(),
+                    stderr: "wait error".into(),
+                };
+            }
         }
     }
 }
 
-struct CmdResult {
-    code: i32,
-    stdout: String,
-    stderr: String,
-}
-
-/// RAII guard that cleans up a session on drop.
-struct TestSession {
-    name: String,
-}
-
-impl TestSession {
-    fn new(prefix: &str) -> Self {
-        // Unique name per test to avoid collisions
-        let name = format!("{prefix}-{}", std::process::id());
-        Self { name }
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-}
-
-impl Drop for TestSession {
-    fn drop(&mut self) {
-        // Kill server if running
-        let _ = Command::new("pkill")
-            .args(["-f", &format!("mn --server {}", self.name)])
-            .output();
-        // Small delay for cleanup
-        std::thread::sleep(Duration::from_millis(100));
-        // Remove socket
-        if let Ok(home) = std::env::var("HOME") {
-            let socket = PathBuf::from(home).join(".mneme").join(&self.name);
-            let _ = std::fs::remove_file(socket);
-        }
-    }
-}
-
-const DETACH: &[u8] = b"\x1c"; // Ctrl-backslash
+const DETACH: &[u8] = b"\x1c";
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -146,273 +230,182 @@ const DETACH: &[u8] = b"\x1c"; // Ctrl-backslash
 
 #[test]
 fn create_only_and_list() {
-    let sess = TestSession::new("create-list");
+    let env = TestEnv::new();
+    let sess = env.session("create-list");
 
-    // Create without attaching
-    let r = mn_run(&["-n", sess.name(), "/bin/sh", "-c", "sleep 60"], 5);
+    let r = env.run(&["-n", &sess, "/bin/sh", "-c", "sleep 60"], 5);
     assert_eq!(r.code, 0, "create failed: {}", r.stderr);
     assert!(r.stderr.contains("session created"), "stderr: {}", r.stderr);
 
-    // Wait for server to be ready
     std::thread::sleep(Duration::from_millis(500));
 
-    // List should show the session
-    let r = mn_run(&[], 5);
+    let r = env.run(&[], 5);
     assert_eq!(r.code, 0, "list failed: {}", r.stderr);
-    assert!(
-        r.stdout.contains(sess.name()),
-        "session not in list: {}",
-        r.stdout
-    );
-    assert!(
-        r.stdout.contains("Active sessions"),
-        "missing header: {}",
-        r.stdout
-    );
+    assert!(r.stdout.contains(&sess), "session not in list: {}", r.stdout);
+    assert!(r.stdout.contains("Active sessions"), "missing header: {}", r.stdout);
 }
 
 #[test]
 fn create_attach_detach() {
-    let sess = TestSession::new("create-attach");
+    let env = TestEnv::new();
+    let sess = env.session("create-attach");
 
-    // Create+attach: child echoes then sleeps, we detach after a delay.
-    // Spawn mn, wait a moment for output, then send detach key.
-    let mut child = Command::new(mn())
-        .args(["-c", sess.name(), "/bin/sh", "-c", "echo HELLO_WORLD; sleep 60"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn");
+    // Spawn mn -c, wait for output, then send detach key
+    let mut child = env.spawn(&["-c", &sess, "/bin/sh", "-c", "echo HELLO_WORLD; sleep 60"]);
 
-    // Give the child time to produce output
     std::thread::sleep(Duration::from_secs(1));
 
-    // Send detach key
     if let Some(mut stdin) = child.stdin.take() {
         stdin.write_all(DETACH).ok();
         drop(stdin);
     }
 
-    let output = wait_with_timeout(&mut child, Duration::from_secs(5))
-        .expect("timeout waiting for detach");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let code = output.status.code().unwrap_or(-1);
-
-    assert_eq!(code, 0, "create+attach failed: {stderr}");
-    assert!(
-        stdout.contains("HELLO_WORLD"),
-        "output missing: stdout='{stdout}'",
-    );
-    assert!(stderr.contains("detached"), "not detached: {stderr}");
+    let r = collect_output(&mut child, Duration::from_secs(5));
+    assert_eq!(r.code, 0, "create+attach failed: {}", r.stderr);
+    assert!(r.stdout.contains("HELLO_WORLD"), "output missing: stdout='{}'", r.stdout);
+    assert!(r.stderr.contains("detached"), "not detached: {}", r.stderr);
 }
 
 #[test]
 fn replay_on_reattach() {
-    let sess = TestSession::new("replay");
+    let env = TestEnv::new();
+    let sess = env.session("replay");
 
-    // Create+attach, child prints lines, detach immediately
-    let r = mn_run_with_stdin(
-        &[
-            "-c",
-            sess.name(),
-            "/bin/sh",
-            "-c",
-            "echo LINE_ONE; echo LINE_TWO; echo LINE_THREE; sleep 60",
-        ],
+    let r = env.run_with_stdin(
+        &["-c", &sess, "/bin/sh", "-c", "echo LINE_ONE; echo LINE_TWO; echo LINE_THREE; sleep 60"],
         Some(DETACH),
         5,
     );
     assert_eq!(r.code, 0, "create failed: {}", r.stderr);
 
-    // Small delay for ring buffer to capture output
     std::thread::sleep(Duration::from_millis(500));
 
-    // Reattach — should see replayed output
-    let r = mn_run_with_stdin(&["-a", sess.name()], Some(DETACH), 5);
+    let r = env.run_with_stdin(&["-a", &sess], Some(DETACH), 5);
     assert_eq!(r.code, 0, "reattach failed: {}", r.stderr);
-    assert!(
-        r.stdout.contains("LINE_ONE"),
-        "replay missing LINE_ONE: stdout='{}'",
-        r.stdout
-    );
-    assert!(
-        r.stdout.contains("LINE_TWO"),
-        "replay missing LINE_TWO: stdout='{}'",
-        r.stdout
-    );
-    assert!(
-        r.stdout.contains("LINE_THREE"),
-        "replay missing LINE_THREE: stdout='{}'",
-        r.stdout
-    );
+    assert!(r.stdout.contains("LINE_ONE"), "replay missing LINE_ONE: stdout='{}'", r.stdout);
+    assert!(r.stdout.contains("LINE_TWO"), "replay missing LINE_TWO: stdout='{}'", r.stdout);
+    assert!(r.stdout.contains("LINE_THREE"), "replay missing LINE_THREE: stdout='{}'", r.stdout);
 }
 
 #[test]
 fn fast_exit_child() {
-    let sess = TestSession::new("fast-exit");
+    let env = TestEnv::new();
+    let sess = env.session("fast-exit");
 
-    let r = mn_run(&["-c", sess.name(), "/usr/bin/true"], 5);
+    let r = env.run(&["-c", &sess, "/usr/bin/true"], 5);
     assert_eq!(r.code, 0, "fast exit failed: {}", r.stderr);
-    assert!(
-        r.stderr.contains("exit status 0"),
-        "wrong exit message: {}",
-        r.stderr
-    );
+    assert!(r.stderr.contains("exit status 0"), "wrong exit message: {}", r.stderr);
 }
 
 #[test]
 fn fast_exit_child_nonzero() {
-    let sess = TestSession::new("fast-exit-nz");
+    let env = TestEnv::new();
+    let sess = env.session("fast-exit-nz");
 
-    let r = mn_run(&["-c", sess.name(), "/usr/bin/false"], 5);
+    let r = env.run(&["-c", &sess, "/usr/bin/false"], 5);
     assert_eq!(r.code, 1, "expected exit code 1, got {}: {}", r.code, r.stderr);
-    assert!(
-        r.stderr.contains("exit status 1"),
-        "wrong exit message: {}",
-        r.stderr
-    );
+    assert!(r.stderr.contains("exit status 1"), "wrong exit message: {}", r.stderr);
 }
 
 #[test]
 fn attach_or_create_new() {
-    let sess = TestSession::new("aoc-new");
+    let env = TestEnv::new();
+    let sess = env.session("aoc-new");
 
-    // -A on nonexistent session should create+attach
-    let r = mn_run_with_stdin(
-        &["-A", sess.name(), "/bin/sh", "-c", "echo FRESH; sleep 60"],
+    let r = env.run_with_stdin(
+        &["-A", &sess, "/bin/sh", "-c", "echo FRESH; sleep 60"],
         Some(DETACH),
         5,
     );
     assert_eq!(r.code, 0, "-A new failed: {}", r.stderr);
-    assert!(
-        r.stderr.contains("session created"),
-        "missing created msg: {}",
-        r.stderr
-    );
+    assert!(r.stderr.contains("session created"), "missing created msg: {}", r.stderr);
 }
 
 #[test]
 fn attach_or_create_existing() {
-    let sess = TestSession::new("aoc-exist");
+    let env = TestEnv::new();
+    let sess = env.session("aoc-exist");
 
-    // Create first
-    let r = mn_run(&["-n", sess.name(), "/bin/sh", "-c", "echo EXISTS; sleep 60"], 5);
+    let r = env.run(&["-n", &sess, "/bin/sh", "-c", "echo EXISTS; sleep 60"], 5);
     assert_eq!(r.code, 0, "create failed: {}", r.stderr);
     std::thread::sleep(Duration::from_millis(500));
 
-    // -A should attach (not create)
-    let r = mn_run_with_stdin(&["-A", sess.name()], Some(DETACH), 5);
+    let r = env.run_with_stdin(&["-A", &sess], Some(DETACH), 5);
     assert_eq!(r.code, 0, "-A existing failed: {}", r.stderr);
-    assert!(
-        !r.stderr.contains("session created"),
-        "should not re-create: {}",
-        r.stderr
-    );
-    assert!(
-        r.stderr.contains("detached"),
-        "should detach: {}",
-        r.stderr
-    );
+    assert!(!r.stderr.contains("session created"), "should not re-create: {}", r.stderr);
+    assert!(r.stderr.contains("detached"), "should detach: {}", r.stderr);
 }
 
 #[test]
 fn force_recreate() {
-    let sess = TestSession::new("force");
+    let env = TestEnv::new();
+    let sess = env.session("force");
 
-    // Create session
-    let r = mn_run(&["-n", sess.name(), "/bin/sh", "-c", "sleep 60"], 5);
+    let r = env.run(&["-n", &sess, "/bin/sh", "-c", "sleep 60"], 5);
     assert_eq!(r.code, 0, "first create failed: {}", r.stderr);
     std::thread::sleep(Duration::from_millis(500));
 
     // Without -f, should fail
-    let r = mn_run(
-        &["-n", sess.name(), "/bin/sh", "-c", "sleep 60"],
-        5,
-    );
+    let r = env.run(&["-n", &sess, "/bin/sh", "-c", "sleep 60"], 5);
     assert_ne!(r.code, 0, "duplicate create should fail");
-    assert!(
-        r.stderr.contains("already exists"),
-        "wrong error: {}",
-        r.stderr
-    );
+    assert!(r.stderr.contains("already exists"), "wrong error: {}", r.stderr);
 
     // With -f, should succeed
-    let r = mn_run(
-        &["-f", "-n", sess.name(), "/bin/sh", "-c", "sleep 60"],
-        5,
-    );
+    let r = env.run(&["-f", "-n", &sess, "/bin/sh", "-c", "sleep 60"], 5);
     assert_eq!(r.code, 0, "force create failed: {}", r.stderr);
 }
 
 #[test]
 fn quiet_mode() {
-    let sess = TestSession::new("quiet");
+    let env = TestEnv::new();
+    let sess = env.session("quiet");
 
-    let r = mn_run(&["-q", "-n", sess.name(), "/bin/sh", "-c", "sleep 60"], 5);
+    let r = env.run(&["-q", "-n", &sess, "/bin/sh", "-c", "sleep 60"], 5);
     assert_eq!(r.code, 0, "quiet create failed: {}", r.stderr);
-    assert!(
-        r.stderr.is_empty(),
-        "quiet mode should suppress stderr: '{}'",
-        r.stderr
-    );
+    assert!(r.stderr.is_empty(), "quiet mode should suppress stderr: '{}'", r.stderr);
 }
 
 #[test]
-fn session_query_shows_child_status() {
-    let sess = TestSession::new("query-status");
+fn session_cleanup_after_exit() {
+    let env = TestEnv::new();
+    let sess = env.session("cleanup");
 
-    // Create with a child that exits
-    let r = mn_run(&["-c", sess.name(), "/usr/bin/true"], 5);
-    assert!(
-        r.stderr.contains("exit status 0"),
-        "wrong exit: {}",
-        r.stderr
-    );
+    let r = env.run(&["-c", &sess, "/usr/bin/true"], 5);
+    assert!(r.stderr.contains("exit status 0"), "wrong exit: {}", r.stderr);
 
-    // The server should have exited, session gone
+    // Server should have exited — session gone from list
     std::thread::sleep(Duration::from_millis(500));
-    let r = mn_run(&[], 5);
-    // Session should not appear in list (server exited after client was notified)
-    assert!(
-        !r.stdout.contains(sess.name()),
-        "exited session should be gone: {}",
-        r.stdout
-    );
+    let r = env.run(&[], 5);
+    assert!(!r.stdout.contains(&sess), "exited session should be gone: {}", r.stdout);
 }
 
 #[test]
 fn invalid_session_name_rejected() {
-    let r = mn_run(&["-c", "bad/name", "/bin/sh"], 5);
+    let env = TestEnv::new();
+    let r = env.run(&["-c", "bad/name", "/bin/sh"], 5);
     assert_ne!(r.code, 0);
     assert!(r.stderr.contains("alphanumeric"), "wrong error: {}", r.stderr);
 }
 
 #[test]
 fn attach_nonexistent_fails() {
-    let r = mn_run(&["-a", "does-not-exist-99999"], 5);
+    let env = TestEnv::new();
+    let r = env.run(&["-a", "does-not-exist-99999"], 5);
     assert_ne!(r.code, 0, "should fail: {}", r.stderr);
 }
 
 #[test]
 fn mutual_exclusion() {
-    let r = mn_run(&["-c", "-a", "test"], 5);
+    let env = TestEnv::new();
+    let r = env.run(&["-c", "-a", "test"], 5);
     assert_ne!(r.code, 0);
-    assert!(
-        r.stderr.contains("cannot be used with"),
-        "wrong error: {}",
-        r.stderr
-    );
+    assert!(r.stderr.contains("cannot be used with"), "wrong error: {}", r.stderr);
 }
 
 #[test]
 fn missing_session_name() {
-    let r = mn_run(&["-c"], 5);
+    let env = TestEnv::new();
+    let r = env.run(&["-c"], 5);
     assert_ne!(r.code, 0);
-    assert!(
-        r.stderr.contains("session name"),
-        "wrong error: {}",
-        r.stderr
-    );
+    assert!(r.stderr.contains("session name"), "wrong error: {}", r.stderr);
 }

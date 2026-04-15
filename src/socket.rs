@@ -108,18 +108,28 @@ pub fn socket_path(name: &str) -> Result<PathBuf, io::Error> {
 // ---------------------------------------------------------------------------
 
 /// Ensure a directory exists, is owned by `expected_uid`, and has the
-/// given mode. Uses open(O_DIRECTORY|O_NOFOLLOW) + fstat on the opened
-/// fd — no TOCTOU gap, no symlink following.
+/// given mode. For the leaf directory: uses open(O_DIRECTORY|O_NOFOLLOW)
+/// + fstat on the opened fd. Parent path components are allowed to be
+/// symlinks (e.g. /var → /private/var on macOS).
 fn ensure_safe_dir(path: &Path, expected_uid: u32, mode: Mode) -> io::Result<()> {
+    // Resolve symlinks in parent components, keep the leaf unresolved
+    let canonical = match path.parent() {
+        Some(parent) if parent != Path::new("") => {
+            let resolved_parent = parent.canonicalize()?;
+            resolved_parent.join(path.file_name().unwrap())
+        }
+        _ => path.to_path_buf(),
+    };
+
     // Try to create (ignore AlreadyExists)
-    match fs::mkdir(path, mode) {
+    match fs::mkdir(&canonical, mode) {
         Ok(()) => {}
         Err(rustix::io::Errno::EXIST) => {}
         Err(e) => return Err(e.into()),
     }
 
-    // Open the directory with O_NOFOLLOW — refuses symlinks
-    let fd = open_dir_nofollow(path)?;
+    // Open the leaf directory with O_NOFOLLOW — refuses symlinks
+    let fd = open_dir_nofollow(&canonical)?;
 
     // Verify ownership and permissions via fstat on the opened fd
     verify_dir_fd(&fd, expected_uid)?;
@@ -131,18 +141,24 @@ fn ensure_safe_dir(path: &Path, expected_uid: u32, mode: Mode) -> io::Result<()>
 /// We don't verify ownership since it's shared — but we do verify it's
 /// a real directory (not a symlink).
 fn ensure_shared_base(path: &Path) -> io::Result<()> {
+    // Resolve symlinks in parent components
+    let canonical = match path.parent() {
+        Some(parent) if parent != Path::new("") => {
+            let resolved_parent = parent.canonicalize()?;
+            resolved_parent.join(path.file_name().unwrap())
+        }
+        _ => path.to_path_buf(),
+    };
+
     // 1777 = rwxrwxrwx + sticky bit
     let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO | Mode::SVTX;
-    match fs::mkdir(path, mode) {
+    match fs::mkdir(&canonical, mode) {
         Ok(()) => {}
         Err(rustix::io::Errno::EXIST) => {}
         Err(e) => return Err(e.into()),
     }
 
-    // Verify it's actually a directory (not a symlink to elsewhere).
-    // Use lstat (AT_SYMLINK_NOFOLLOW) — if it's a symlink, the type
-    // won't be directory.
-    let stat = fs::statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW)?;
+    let stat = fs::statat(CWD, &canonical, AtFlags::SYMLINK_NOFOLLOW)?;
     let file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
     if file_type != rustix::fs::FileType::Directory {
         return Err(io::Error::new(io::ErrorKind::Other, "not a directory"));
