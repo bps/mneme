@@ -288,3 +288,87 @@ fn profile_baseline_pty_latency() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+#[test]
+fn profile_baseline_pty_throughput() {
+    // Write 1 MiB through a raw PTY using dd — no mn in the path.
+    let mut leader: libc::c_int = -1;
+    let mut follower: libc::c_int = -1;
+    let ret = unsafe {
+        libc::openpty(
+            &mut leader,
+            &mut follower,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(ret, 0, "openpty failed");
+
+    let leader_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(leader) };
+    let follower_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(follower) };
+
+    let follower_clone1 = follower_fd.try_clone().unwrap();
+    let follower_clone2 = follower_fd.try_clone().unwrap();
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "dd if=/dev/zero bs=65536 count=16 2>/dev/null"])
+        .stdin(Stdio::from(follower_fd))
+        .stdout(Stdio::from(follower_clone1))
+        .stderr(Stdio::from(follower_clone2))
+        .spawn()
+        .expect("spawn dd");
+
+    use std::os::fd::IntoRawFd;
+    use std::io::Read;
+
+    // Set leader to non-blocking so we can detect EOF
+    unsafe {
+        let flags = libc::fcntl(leader_fd.as_raw_fd(), libc::F_GETFL);
+        libc::fcntl(leader_fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+
+    use std::os::fd::AsRawFd;
+    let raw_fd = leader_fd.as_raw_fd();
+    let mut leader_file = unsafe { std::fs::File::from_raw_fd(leader_fd.into_raw_fd()) };
+
+    const TOTAL: usize = 65536 * 16;
+    let mut received = 0;
+    let mut buf = [0u8; 65536];
+
+    let start = Instant::now();
+
+    while received < TOTAL {
+        // Use poll to wait for data
+        let mut pfd = libc::pollfd {
+            fd: raw_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pfd, 1, 5000) };
+        if ret <= 0 {
+            break;
+        }
+        match leader_file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => received += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(e) if e.raw_os_error() == Some(libc::EIO) => break, // child exited
+            Err(e) => {
+                eprintln!("read error: {e}");
+                break;
+            }
+        }
+    }
+
+    let elapsed = start.elapsed();
+    let mb_per_sec = (received as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
+
+    eprintln!();
+    eprintln!("=== Baseline PTY throughput (1 MiB one-way, no mn) ===");
+    eprintln!("  received:  {} bytes", received);
+    eprintln!("  time:      {:.1}ms", elapsed.as_secs_f64() * 1000.0);
+    eprintln!("  rate:      {:.1} MiB/s", mb_per_sec);
+
+    let _ = child.kill();
+    let _ = child.wait();
+}
