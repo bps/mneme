@@ -4,6 +4,7 @@ mod ring;
 mod server;
 mod socket;
 
+use clap::Parser;
 use std::env;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::process;
@@ -11,7 +12,7 @@ use std::process;
 fn main() {
     let args: Vec<String> = env::args().collect();
 
-    // Internal server mode — not user-facing
+    // Internal server mode — not user-facing, not handled by clap
     if args.get(1).map(|s| s.as_str()) == Some("--server") {
         match server::run_server(&args[2..]) {
             Ok(()) => process::exit(0),
@@ -22,119 +23,74 @@ fn main() {
         }
     }
 
-    match run_cli(&args[1..]) {
+    let cli = Cli::parse();
+
+    match run_cli(cli) {
         Ok(code) => process::exit(code),
         Err(e) => {
-            eprintln!("mneme: {e}");
+            eprintln!("mn: {e}");
             process::exit(1);
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// CLI parsing
+// CLI definition
 // ---------------------------------------------------------------------------
 
-#[derive(Debug)]
-struct CliOpts {
-    action: Action,
-    session_name: String,
-    command: Vec<String>,
+/// Session persistence for terminal processes.
+///
+/// Run with no arguments to list active sessions.
+#[derive(Parser, Debug)]
+#[command(name = "mn", version, about)]
+struct Cli {
+    /// Create session and attach
+    #[arg(short = 'c', group = "action")]
+    create: bool,
+
+    /// Create session without attaching
+    #[arg(short = 'n', group = "action")]
+    create_only: bool,
+
+    /// Attach to existing session
+    #[arg(short = 'a', group = "action")]
+    attach: bool,
+
+    /// Attach if session exists, otherwise create
+    #[arg(short = 'A', group = "action")]
+    attach_or_create: bool,
+
+    /// Detach key (e.g. ^q for Ctrl-Q)
+    #[arg(short = 'e', value_name = "KEY", value_parser = parse_detach_key, default_value = "^\x5c")]
     detach_key: u8,
+
+    /// Attach in read-only mode
+    #[arg(short = 'r')]
     readonly: bool,
+
+    /// Low-priority client (defer resize to others)
+    #[arg(short = 'l')]
     low_priority: bool,
+
+    /// Suppress informational messages
+    #[arg(short = 'q')]
     quiet: bool,
+
+    /// Force reuse of existing session name
+    #[arg(short = 'f')]
     force: bool,
+
+    /// Ring buffer size (e.g. 2M, 512K, 65536)
+    #[arg(short = 's', value_name = "SIZE", value_parser = parse_size, default_value = "1M")]
     ring_size: usize,
-}
 
-#[derive(Debug, Clone, Copy)]
-enum Action {
-    List,
-    Create,       // -c: create + attach
-    CreateOnly,   // -n: create, don't attach
-    Attach,       // -a: attach only
-    AttachOrCreate, // -A: attach if exists, else create
-}
+    /// Session name
+    #[arg(value_name = "NAME")]
+    session_name: Option<String>,
 
-const DEFAULT_RING_SIZE: usize = 1024 * 1024; // 1 MiB
-const DEFAULT_DETACH_KEY: u8 = 0x1C; // Ctrl-backslash
-
-fn parse_args(args: &[String]) -> Result<CliOpts, String> {
-    let mut action = None;
-    let mut session_name = None;
-    let mut detach_key = DEFAULT_DETACH_KEY;
-    let mut readonly = false;
-    let mut low_priority = false;
-    let mut quiet = false;
-    let mut force = false;
-    let mut ring_size = DEFAULT_RING_SIZE;
-    let mut command = Vec::new();
-
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-c" => action = Some(Action::Create),
-            "-n" => action = Some(Action::CreateOnly),
-            "-a" => action = Some(Action::Attach),
-            "-A" => action = Some(Action::AttachOrCreate),
-            "-r" => readonly = true,
-            "-l" => low_priority = true,
-            "-q" => quiet = true,
-            "-f" => force = true,
-            "-e" => {
-                i += 1;
-                let key_str = args.get(i).ok_or("-e requires an argument")?;
-                detach_key = parse_detach_key(key_str)?;
-            }
-            "-s" => {
-                i += 1;
-                let size_str = args.get(i).ok_or("-s requires an argument")?;
-                ring_size = parse_size(size_str)?;
-            }
-            other => {
-                if session_name.is_none() {
-                    session_name = Some(other.to_string());
-                } else {
-                    // Everything after session name is the command
-                    command = args[i..].to_vec();
-                    break;
-                }
-            }
-        }
-        i += 1;
-    }
-
-    // No arguments at all → list
-    if action.is_none() && session_name.is_none() {
-        return Ok(CliOpts {
-            action: Action::List,
-            session_name: String::new(),
-            command: Vec::new(),
-            detach_key,
-            readonly,
-            low_priority,
-            quiet,
-            force,
-            ring_size,
-        });
-    }
-
-    let action = action.ok_or("usage: mneme [-a|-A|-c|-n] [-r] [-q] [-f] [-e key] [-s size] name [command...]")?;
-    let session_name = session_name.ok_or("session name required")?;
-    socket::validate_session_name(&session_name)?;
-
-    Ok(CliOpts {
-        action,
-        session_name,
-        command,
-        detach_key,
-        readonly,
-        low_priority,
-        quiet,
-        force,
-        ring_size,
-    })
+    /// Command to run in the session
+    #[arg(trailing_var_arg = true, value_name = "CMD")]
+    command: Vec<String>,
 }
 
 fn parse_detach_key(s: &str) -> Result<u8, String> {
@@ -164,35 +120,79 @@ fn parse_size(s: &str) -> Result<usize, String> {
 }
 
 // ---------------------------------------------------------------------------
-// CLI dispatch
+// Dispatch
 // ---------------------------------------------------------------------------
 
-fn run_cli(args: &[String]) -> Result<i32, Box<dyn std::error::Error>> {
-    let opts = parse_args(args).map_err(|e| e.to_string())?;
+/// Resolve which action to take from the parsed CLI flags.
+fn resolve_action(cli: &Cli) -> Result<Action, String> {
+    let needs_name = cli.create || cli.create_only || cli.attach || cli.attach_or_create;
+    if needs_name && cli.session_name.is_none() {
+        return Err("session name required".into());
+    }
+    if cli.create {
+        Ok(Action::Create)
+    } else if cli.create_only {
+        Ok(Action::CreateOnly)
+    } else if cli.attach {
+        Ok(Action::Attach)
+    } else if cli.attach_or_create {
+        Ok(Action::AttachOrCreate)
+    } else if cli.session_name.is_none() {
+        Ok(Action::List)
+    } else {
+        Err("an action flag (-c, -n, -a, or -A) is required when a session name is given".into())
+    }
+}
 
-    match opts.action {
+#[derive(Debug, Clone, Copy)]
+enum Action {
+    List,
+    Create,
+    CreateOnly,
+    Attach,
+    AttachOrCreate,
+}
+
+fn run_cli(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
+    let action = resolve_action(&cli)?;
+
+    // Validate session name for actions that need one
+    if let Some(ref name) = cli.session_name {
+        socket::validate_session_name(name)?;
+    }
+
+    match action {
         Action::List => {
             list_sessions()?;
             Ok(0)
         }
         Action::Create => {
-            create_session(&opts)?;
-            attach_session(&opts)
+            create_session(&cli)?;
+            attach_session(&cli)
         }
         Action::CreateOnly => {
-            create_session(&opts)?;
+            create_session(&cli)?;
             Ok(0)
         }
-        Action::Attach => attach_session(&opts),
+        Action::Attach => attach_session(&cli),
         Action::AttachOrCreate => {
-            if session_exists(&opts.session_name)? {
-                attach_session(&opts)
+            let name = cli.session_name.as_deref().unwrap();
+            if session_exists(name)? {
+                attach_session(&cli)
             } else {
-                create_session(&opts)?;
-                attach_session(&opts)
+                create_session(&cli)?;
+                attach_session(&cli)
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Session operations
+// ---------------------------------------------------------------------------
+
+fn session_name(cli: &Cli) -> &str {
+    cli.session_name.as_deref().expect("session name required")
 }
 
 fn default_command() -> Vec<String> {
@@ -213,39 +213,36 @@ fn get_terminal_size() -> (u16, u16) {
     }
 }
 
-fn create_session(opts: &CliOpts) -> Result<(), Box<dyn std::error::Error>> {
-    let socket_path = socket::socket_path(&opts.session_name)?;
+fn create_session(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let name = session_name(cli);
+    let socket_path = socket::socket_path(name)?;
 
     // Check for existing session
     if socket_path.exists() {
-        if !opts.force {
-            // Try connecting to see if it's alive
+        if !cli.force {
             match std::os::unix::net::UnixStream::connect(&socket_path) {
                 Ok(_) => {
                     return Err(format!(
-                        "session '{}' already exists (use -f to force)",
-                        opts.session_name
+                        "session '{name}' already exists (use -f to force)"
                     )
                     .into());
                 }
                 Err(_) => {
-                    // Stale socket — still require -f to be explicit
                     return Err(format!(
-                        "stale socket for '{}' exists (use -f to force)",
-                        opts.session_name
+                        "stale socket for '{name}' exists (use -f to force)"
                     )
                     .into());
                 }
             }
         }
-        // -f: remove the existing socket
         let _ = std::fs::remove_file(&socket_path);
     }
+
     let (rows, cols) = get_terminal_size();
-    let cmd = if opts.command.is_empty() {
+    let cmd = if cli.command.is_empty() {
         default_command()
     } else {
-        opts.command.clone()
+        cli.command.clone()
     };
 
     // Create a pipe for readiness signaling.
@@ -256,19 +253,16 @@ fn create_session(opts: &CliOpts) -> Result<(), Box<dyn std::error::Error>> {
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        // Set CLOEXEC on the read end (CLI keeps it, doesn't need to pass it)
         unsafe {
             libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
         }
-        // Do NOT set CLOEXEC on fds[1] — the server needs it
         (unsafe { OwnedFd::from_raw_fd(fds[0]) }, fds[1])
     };
 
-    // Build server args
     let exe = env::current_exe()?;
-    let mut server_args = vec![
+    let mut server_args: Vec<String> = vec![
         "--server".into(),
-        opts.session_name.clone(),
+        name.into(),
         "--ready-fd".into(),
         format!("{server_raw_fd}"),
         "--rows".into(),
@@ -276,14 +270,13 @@ fn create_session(opts: &CliOpts) -> Result<(), Box<dyn std::error::Error>> {
         "--cols".into(),
         format!("{cols}"),
         "--ring-size".into(),
-        format!("{}", opts.ring_size),
+        format!("{}", cli.ring_size),
         "--socket-path".into(),
         socket_path.to_string_lossy().to_string(),
         "--".into(),
     ];
     server_args.extend(cmd);
 
-    // Spawn the server process
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -297,8 +290,9 @@ fn create_session(opts: &CliOpts) -> Result<(), Box<dyn std::error::Error>> {
 
     let _child = command.spawn()?;
 
-    // Close the write end in the parent so only the server has it
-    unsafe { libc::close(server_raw_fd); }
+    unsafe {
+        libc::close(server_raw_fd);
+    }
 
     // Wait for readiness: EOF = ready, data = error
     let mut error_buf = vec![0u8; 4096];
@@ -308,20 +302,21 @@ fn create_session(opts: &CliOpts) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("server startup failed: {msg}").into());
     }
 
-    if !opts.quiet {
-        eprintln!("mneme: {}: session created", opts.session_name);
+    if !cli.quiet {
+        eprintln!("mn: {name}: session created");
     }
     Ok(())
 }
 
-fn attach_session(opts: &CliOpts) -> Result<i32, Box<dyn std::error::Error>> {
-    let socket_path = socket::socket_path(&opts.session_name)?;
+fn attach_session(cli: &Cli) -> Result<i32, Box<dyn std::error::Error>> {
+    let name = session_name(cli);
+    let socket_path = socket::socket_path(name)?;
     let flags = {
         let mut f = protocol::ClientFlags::empty();
-        if opts.readonly {
+        if cli.readonly {
             f |= protocol::ClientFlags::READONLY;
         }
-        if opts.low_priority {
+        if cli.low_priority {
             f |= protocol::ClientFlags::LOW_PRIORITY;
         }
         f
@@ -333,29 +328,26 @@ fn attach_session(opts: &CliOpts) -> Result<i32, Box<dyn std::error::Error>> {
         flags,
         rows,
         cols,
-        opts.detach_key,
-        opts.quiet,
+        cli.detach_key,
+        cli.quiet,
     )?;
 
     match status {
         client::AttachResult::Detached => {
-            if !opts.quiet {
-                eprintln!("mneme: {}: detached", opts.session_name);
+            if !cli.quiet {
+                eprintln!("mn: {name}: detached");
             }
             Ok(0)
         }
         client::AttachResult::Exited(code) => {
-            if !opts.quiet {
-                eprintln!(
-                    "mneme: {}: session terminated with exit status {code}",
-                    opts.session_name
-                );
+            if !cli.quiet {
+                eprintln!("mn: {name}: session terminated with exit status {code}");
             }
             Ok(code as i32)
         }
         client::AttachResult::IoError => {
-            if !opts.quiet {
-                eprintln!("mneme: {}: exited due to I/O errors", opts.session_name);
+            if !cli.quiet {
+                eprintln!("mn: {name}: exited due to I/O errors");
             }
             Ok(1)
         }
@@ -367,11 +359,9 @@ fn session_exists(name: &str) -> Result<bool, Box<dyn std::error::Error>> {
     if !path.exists() {
         return Ok(false);
     }
-    // Verify the session is actually alive by trying to connect
     match std::os::unix::net::UnixStream::connect(&path) {
         Ok(_) => Ok(true),
         Err(_) => {
-            // Stale socket — clean it up
             let _ = std::fs::remove_file(&path);
             Ok(false)
         }
@@ -392,7 +382,6 @@ fn list_sessions() -> Result<(), Box<dyn std::error::Error>> {
         let entry = entry?;
         let path = entry.path();
 
-        // Skip non-sockets
         let meta = match entry.metadata() {
             Ok(m) => m,
             Err(_) => continue,
@@ -404,11 +393,9 @@ fn list_sessions() -> Result<(), Box<dyn std::error::Error>> {
 
         let name = entry.file_name().to_string_lossy().to_string();
 
-        // Try to query the session
         let welcome = match query_session(&path) {
             Ok(w) => Some(w),
             Err(_) => {
-                // Stale socket — try to clean up
                 let _ = std::fs::remove_file(&path);
                 None
             }
