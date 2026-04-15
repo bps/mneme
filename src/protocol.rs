@@ -68,37 +68,11 @@ impl Intent {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ClientFlags(pub u16);
-
-impl ClientFlags {
-    pub const READONLY: Self = Self(0x01);
-    pub const LOW_PRIORITY: Self = Self(0x02);
-
-    pub fn empty() -> Self {
-        Self(0)
-    }
-    pub fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
-    }
-    pub fn bits(self) -> u16 {
-        self.0
-    }
-    pub fn from_bits_truncate(bits: u16) -> Self {
-        Self(bits & 0x03)
-    }
-}
-
-impl std::ops::BitOr for ClientFlags {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        Self(self.0 | rhs.0)
-    }
-}
-
-impl std::ops::BitOrAssign for ClientFlags {
-    fn bitor_assign(&mut self, rhs: Self) {
-        self.0 |= rhs.0;
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ClientFlags: u16 {
+        const READONLY     = 0x01;
+        const LOW_PRIORITY = 0x02;
     }
 }
 

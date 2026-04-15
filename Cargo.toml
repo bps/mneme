@@ -8,6 +8,7 @@ name = "mn"
 path = "src/main.rs"
 
 [dependencies]
+bitflags = "2.11.1"
 libc = "0.2.185"
 rustix = { version = "1.1.4", features = ["pty", "termios", "process", "fs", "net", "event", "pipe"] }
 signal-hook = "0.4.4"
