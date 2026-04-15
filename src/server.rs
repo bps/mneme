@@ -790,7 +790,15 @@ fn handle_child_exit(
     *child_running = false;
     *exit_status = match child.try_wait() {
         Ok(Some(status)) => Some(status.code().unwrap_or(1) as u32),
-        _ => Some(1),
+        Ok(None) => {
+            // Child hasn't been reaped yet (EIO arrived before SIGCHLD).
+            // Do a blocking wait — the child is already dead, this returns immediately.
+            match child.wait() {
+                Ok(status) => Some(status.code().unwrap_or(1) as u32),
+                Err(_) => Some(1),
+            }
+        }
+        Err(_) => Some(1),
     };
 
     // Send Exit to all live clients
