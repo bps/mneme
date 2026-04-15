@@ -3,6 +3,10 @@ name = "mneme"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "mn"
+path = "src/main.rs"
+
 [dependencies]
 libc = "0.2.185"
 rustix = { version = "1.1.4", features = ["pty", "termios", "process", "fs", "net", "event", "pipe"] }
