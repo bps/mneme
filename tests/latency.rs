@@ -158,15 +158,15 @@ fn profile_roundtrip_latency() {
 
 #[test]
 fn profile_throughput() {
-    // Measure one-way throughput: child writes data, client reads it.
-    // Uses dd to generate exactly 1 MiB of output.
+    // Measure sustained one-way throughput: child writes 16 MiB, client reads.
+    // Skip initial bytes to avoid measuring startup/buffering artifacts.
     let dir = TempDir::new().expect("tempdir");
     let session = format!("throughput-{}", std::process::id());
 
     let output = Command::new(mn_bin())
         .env("MNEME_SOCKET_DIR", dir.path())
         .args(["new", &session, "/bin/sh", "-c",
-               "sleep 1; dd if=/dev/zero bs=65536 count=16 2>/dev/null; sleep 60"])
+               "sleep 2; dd if=/dev/zero bs=65536 count=256 2>/dev/null; sleep 60"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -179,20 +179,33 @@ fn profile_throughput() {
     let pid = query_pid(&socket).expect("query PID");
     let stream = attach_live(&socket);
 
-    const TOTAL: usize = 65536 * 16; // 1 MiB
+    const TOTAL: usize = 65536 * 256; // 16 MiB
+    const SKIP: usize = 65536 * 16;   // skip first 1 MiB
     let mut received = 0;
-    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+    let mut total_wire = 0;
+    stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
 
+    // Drain until we've skipped SKIP bytes (amortizes startup)
+    while total_wire < SKIP {
+        match mneme::protocol::recv_packet(stream.as_fd()) {
+            Ok(pkt) if pkt.msg_type == mneme::protocol::MsgType::Content => {
+                total_wire += pkt.payload.len();
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+
+    // Now measure the rest
     let start = Instant::now();
-
-    while received < TOTAL {
+    while received < (TOTAL - SKIP) {
         match mneme::protocol::recv_packet(stream.as_fd()) {
             Ok(pkt) if pkt.msg_type == mneme::protocol::MsgType::Content => {
                 received += pkt.payload.len();
             }
             Ok(_) => {}
             Err(e) => {
-                eprintln!("recv error at {received}/{TOTAL}: {e}");
+                eprintln!("recv error at {received}: {e}");
                 break;
             }
         }
@@ -202,7 +215,7 @@ fn profile_throughput() {
     let mb_per_sec = (received as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
 
     eprintln!();
-    eprintln!("=== Throughput (1 MiB one-way, child → client) ===");
+    eprintln!("=== Throughput (16 MiB one-way, child → client) ===");
     eprintln!("  received:  {} bytes", received);
     eprintln!("  time:      {:.1}ms", elapsed.as_secs_f64() * 1000.0);
     eprintln!("  rate:      {:.1} MiB/s", mb_per_sec);
@@ -291,7 +304,7 @@ fn profile_baseline_pty_latency() {
 
 #[test]
 fn profile_baseline_pty_throughput() {
-    // Write 1 MiB through a raw PTY using dd — no mn in the path.
+    // Write 16 MiB through a raw PTY using dd — no mn in the path.
     let mut leader: libc::c_int = -1;
     let mut follower: libc::c_int = -1;
     let ret = unsafe {
@@ -311,7 +324,7 @@ fn profile_baseline_pty_throughput() {
     let follower_clone1 = follower_fd.try_clone().unwrap();
     let follower_clone2 = follower_fd.try_clone().unwrap();
     let mut child = Command::new("/bin/sh")
-        .args(["-c", "dd if=/dev/zero bs=65536 count=16 2>/dev/null"])
+        .args(["-c", "dd if=/dev/zero bs=65536 count=256 2>/dev/null"])
         .stdin(Stdio::from(follower_fd))
         .stdout(Stdio::from(follower_clone1))
         .stderr(Stdio::from(follower_clone2))
@@ -321,7 +334,6 @@ fn profile_baseline_pty_throughput() {
     use std::os::fd::IntoRawFd;
     use std::io::Read;
 
-    // Set leader to non-blocking so we can detect EOF
     unsafe {
         let flags = libc::fcntl(leader_fd.as_raw_fd(), libc::F_GETFL);
         libc::fcntl(leader_fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
@@ -331,7 +343,7 @@ fn profile_baseline_pty_throughput() {
     let raw_fd = leader_fd.as_raw_fd();
     let mut leader_file = unsafe { std::fs::File::from_raw_fd(leader_fd.into_raw_fd()) };
 
-    const TOTAL: usize = 65536 * 16;
+    const TOTAL: usize = 65536 * 256; // 16 MiB
     let mut received = 0;
     let mut buf = [0u8; 65536];
 
@@ -364,7 +376,7 @@ fn profile_baseline_pty_throughput() {
     let mb_per_sec = (received as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
 
     eprintln!();
-    eprintln!("=== Baseline PTY throughput (1 MiB one-way, no mn) ===");
+    eprintln!("=== Baseline PTY throughput (16 MiB one-way, no mn) ===");
     eprintln!("  received:  {} bytes", received);
     eprintln!("  time:      {:.1}ms", elapsed.as_secs_f64() * 1000.0);
     eprintln!("  rate:      {:.1} MiB/s", mb_per_sec);
