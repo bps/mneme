@@ -1,6 +1,8 @@
 use std::io;
-use std::os::unix::fs::DirBuilderExt;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
+
+use rustix::fs::{self, AtFlags, Mode, OFlags, CWD};
 
 /// Validate a session name: [a-zA-Z0-9._-], max 64 bytes.
 pub fn validate_session_name(name: &str) -> Result<(), String> {
@@ -68,25 +70,24 @@ pub fn socket_dir() -> Result<PathBuf, io::Error> {
             continue;
         }
 
-        let dir = if personal {
-            base
-        } else {
-            // Create shared base dir, then per-uid subdir
-            if let Err(_e) = create_dir_mode(&base, 0o1777) {
-                continue;
+        if personal {
+            // Single directory: create and verify in one shot
+            match ensure_safe_dir(&base, uid, Mode::RWXU) {
+                Ok(()) => return Ok(base),
+                Err(_) => continue,
             }
-            base.join(uid.to_string())
-        };
-
-        match create_dir_mode(&dir, 0o700) {
-            Ok(()) => {}
-            Err(_) => continue,
-        }
-
-        // Verify ownership and permissions
-        match verify_dir(&dir, uid) {
-            Ok(()) => return Ok(dir),
-            Err(_) => continue,
+        } else {
+            // Shared base + per-uid subdir
+            // Create the shared base with sticky bit (anyone can create subdirs)
+            match ensure_shared_base(&base) {
+                Ok(()) => {}
+                Err(_) => continue,
+            }
+            let user_dir = base.join(uid.to_string());
+            match ensure_safe_dir(&user_dir, uid, Mode::RWXU) {
+                Ok(()) => return Ok(user_dir),
+                Err(_) => continue,
+            }
         }
     }
 
@@ -103,8 +104,94 @@ pub fn socket_path(name: &str) -> Result<PathBuf, io::Error> {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Safe directory operations using openat/fstat (no TOCTOU)
 // ---------------------------------------------------------------------------
+
+/// Ensure a directory exists, is owned by `expected_uid`, and has the
+/// given mode. Uses open(O_DIRECTORY|O_NOFOLLOW) + fstat on the opened
+/// fd — no TOCTOU gap, no symlink following.
+fn ensure_safe_dir(path: &Path, expected_uid: u32, mode: Mode) -> io::Result<()> {
+    // Try to create (ignore AlreadyExists)
+    match fs::mkdir(path, mode) {
+        Ok(()) => {}
+        Err(rustix::io::Errno::EXIST) => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    // Open the directory with O_NOFOLLOW — refuses symlinks
+    let fd = open_dir_nofollow(path)?;
+
+    // Verify ownership and permissions via fstat on the opened fd
+    verify_dir_fd(&fd, expected_uid)?;
+
+    Ok(())
+}
+
+/// Create a shared base directory (e.g. /tmp/mneme) with sticky bit.
+/// We don't verify ownership since it's shared — but we do verify it's
+/// a real directory (not a symlink).
+fn ensure_shared_base(path: &Path) -> io::Result<()> {
+    // 1777 = rwxrwxrwx + sticky bit
+    let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO | Mode::SVTX;
+    match fs::mkdir(path, mode) {
+        Ok(()) => {}
+        Err(rustix::io::Errno::EXIST) => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    // Verify it's actually a directory (not a symlink to elsewhere).
+    // Use lstat (AT_SYMLINK_NOFOLLOW) — if it's a symlink, the type
+    // won't be directory.
+    let stat = fs::statat(CWD, path, AtFlags::SYMLINK_NOFOLLOW)?;
+    let file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
+    if file_type != rustix::fs::FileType::Directory {
+        return Err(io::Error::new(io::ErrorKind::Other, "not a directory"));
+    }
+
+    Ok(())
+}
+
+/// Open a directory with O_NOFOLLOW | O_DIRECTORY. This refuses to
+/// follow symlinks and fails if the path isn't a directory.
+fn open_dir_nofollow(path: &Path) -> io::Result<OwnedFd> {
+    let fd = fs::open(
+        path,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )?;
+    Ok(fd)
+}
+
+/// Verify a directory fd is owned by the expected uid and has no
+/// group/other access (0700).
+fn verify_dir_fd(fd: &OwnedFd, expected_uid: u32) -> io::Result<()> {
+    let stat = fs::fstat(fd)?;
+
+    // Must be a directory
+    let file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
+    if file_type != rustix::fs::FileType::Directory {
+        return Err(io::Error::new(io::ErrorKind::Other, "not a directory"));
+    }
+
+    // Must be owned by us
+    if stat.st_uid != expected_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "directory not owned by current user",
+        ));
+    }
+
+    // Must have no group/other access
+    let perms = stat.st_mode & 0o777;
+    if perms & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "directory has insecure permissions",
+        ));
+    }
+
+    Ok(())
+}
 
 fn dirs_home() -> Option<PathBuf> {
     std::env::var("HOME")
@@ -113,36 +200,9 @@ fn dirs_home() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn create_dir_mode(path: &Path, mode: u32) -> io::Result<()> {
-    match std::fs::DirBuilder::new().mode(mode).create(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
-        Err(e) => Err(e),
-    }
-}
-
-fn verify_dir(path: &Path, expected_uid: u32) -> io::Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path)?;
-    if !meta.is_dir() {
-        return Err(io::Error::new(io::ErrorKind::Other, "not a directory"));
-    }
-    if meta.uid() != expected_uid {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "directory not owned by current user",
-        ));
-    }
-    // Check no group/other access
-    let mode = meta.mode() & 0o777;
-    if mode & 0o077 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "directory has insecure permissions",
-        ));
-    }
-    Ok(())
-}
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -165,5 +225,41 @@ mod tests {
         assert!(validate_session_name("-flag").is_err());
         assert!(validate_session_name(&"a".repeat(65)).is_err());
         assert!(validate_session_name("hello\x00world").is_err());
+    }
+
+    #[test]
+    fn safe_dir_creation() {
+        let tmp = std::env::temp_dir().join("mneme-test-safe-dir");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let uid = rustix::process::getuid().as_raw();
+        ensure_safe_dir(&tmp, uid, Mode::RWXU).unwrap();
+
+        // Verify it exists and has correct permissions
+        let fd = open_dir_nofollow(&tmp).unwrap();
+        verify_dir_fd(&fd, uid).unwrap();
+
+        // Calling again should succeed (idempotent)
+        ensure_safe_dir(&tmp, uid, Mode::RWXU).unwrap();
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn rejects_symlink() {
+        let tmp = std::env::temp_dir();
+        let real_dir = tmp.join("mneme-test-real");
+        let sym_link = tmp.join("mneme-test-sym");
+        let _ = std::fs::remove_dir_all(&real_dir);
+        let _ = std::fs::remove_file(&sym_link);
+
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::os::unix::fs::symlink(&real_dir, &sym_link).unwrap();
+
+        // open_dir_nofollow should refuse the symlink
+        assert!(open_dir_nofollow(&sym_link).is_err());
+
+        let _ = std::fs::remove_dir_all(&real_dir);
+        let _ = std::fs::remove_file(&sym_link);
     }
 }
