@@ -9,8 +9,8 @@ No server optimization was needed — the benchmark was broken.
 
 | Metric | Raw PTY | Through mn | Overhead |
 |--------|---------|------------|----------|
-| Throughput (16 MiB) | 69 MiB/s | 68 MiB/s | < 2% |
-| Latency p50 | 0.8µs | 12.8µs | +12µs |
+| Throughput p50 (1 MiB windows) | 67.8 MiB/s | 51.1 MiB/s | 25% |
+| Latency p50 | 1.0µs | 13.3µs | +12µs |
 
 ## What happened
 
