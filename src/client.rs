@@ -153,6 +153,15 @@ fn client_mainloop(
     let stdin = io::stdin();
     let stdout = io::stdout();
 
+    // Debug: log stdin bytes to a file if MNEME_DEBUG is set
+    let debug_file = std::env::var("MNEME_DEBUG").ok().map(|path| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+    }).flatten();
+
     // Set up SIGWINCH self-pipe
     let (sig_read, sig_write) = {
         let (r, w) = rustix::pipe::pipe()?;
@@ -161,6 +170,11 @@ fn client_mainloop(
         (r, w)
     };
     signal_hook::low_level::pipe::register(libc::SIGWINCH, sig_write)?;
+
+    // Build the CSI u (kitty keyboard protocol) encoding of the detach key.
+    // When a TUI app enables this protocol, Ctrl-\ arrives as ESC[92;5u
+    // instead of byte 0x1C.
+    let csi_u_detach = csi_u_press_sequence(detach_key);
 
     let mut read_buf = [0u8; 4096];
     let mut in_replay = true;
@@ -202,8 +216,15 @@ fn client_mainloop(
             };
 
             if n > 0 {
-                // Check for detach key anywhere in the input
-                if let Some(pos) = read_buf[..n].iter().position(|&b| b == detach_key) {
+                // Debug log
+                if let Some(ref mut f) = debug_file.as_ref() {
+                    use std::io::Write;
+                    let _ = write!(f, "stdin[{}]: {:02x?}\n", n, &read_buf[..n]);
+                }
+
+                // Check for detach key: raw byte or CSI u encoded
+                let detach_pos = find_detach_key(&read_buf[..n], detach_key, &csi_u_detach);
+                if let Some((pos, len)) = detach_pos {
                     // Send any bytes before the detach key
                     if pos > 0 && !flags.contains(ClientFlags::READONLY) {
                         let pkt = Packet::content(&read_buf[..pos]);
@@ -300,4 +321,35 @@ fn try_parse_packet(buf: &[u8]) -> Option<(Packet, usize)> {
     }
     let payload = buf[protocol::HEADER_SIZE..total].to_vec();
     Some((Packet::new(msg_type, payload), total))
+}
+
+/// Build the CSI u (kitty keyboard protocol) encoding for a Ctrl-key press.
+/// E.g., Ctrl-\ (0x1C) → ESC[92;5u (backslash codepoint=92, Ctrl modifier=5).
+fn csi_u_press_sequence(detach_key: u8) -> Vec<u8> {
+    if detach_key >= 0x20 {
+        return Vec::new(); // not a control character
+    }
+    // Control character 0x01..0x1F corresponds to Ctrl + (key | 0x40)
+    // e.g., 0x1C (Ctrl-\) → base char = 0x5C = 92 decimal
+    let base_codepoint = (detach_key as u32) | 0x40;
+    // CSI u format: ESC [ <codepoint> ; <modifiers> u
+    // Ctrl modifier = 5 (modifier bits + 1, where Ctrl = bit 2 = 4, +1 = 5)
+    format!("\x1b[{base_codepoint};5u").into_bytes()
+}
+
+/// Find the detach key in a byte buffer, checking both raw byte and
+/// CSI u (kitty keyboard protocol) encoding.
+/// Returns Some((position, length)) or None.
+fn find_detach_key(buf: &[u8], raw_key: u8, csi_u: &[u8]) -> Option<(usize, usize)> {
+    // Check CSI u first (longer match takes priority to avoid partial matches)
+    if !csi_u.is_empty() {
+        if let Some(pos) = buf.windows(csi_u.len()).position(|w| w == csi_u) {
+            return Some((pos, csi_u.len()));
+        }
+    }
+    // Check raw byte
+    if let Some(pos) = buf.iter().position(|&b| b == raw_key) {
+        return Some((pos, 1));
+    }
+    None
 }
