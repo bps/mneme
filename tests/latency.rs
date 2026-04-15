@@ -1,8 +1,5 @@
 //! Latency and throughput profiling for mn.
 //!
-//! Measures the overhead mn adds to terminal I/O by running `cat` inside
-//! a session and timing round-trips through the server.
-//!
 //! Run with: cargo test --test latency --release -- --nocapture
 
 use std::os::fd::{AsFd, FromRawFd};
@@ -87,6 +84,27 @@ fn kill_server(pid: u32) {
     std::thread::sleep(Duration::from_millis(100));
 }
 
+fn print_stats(label: &str, unit: &str, values: &mut [f64]) {
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = values.len();
+    let mean: f64 = values.iter().sum::<f64>() / n as f64;
+    let p50 = values[n / 2];
+    let p95 = values[n * 95 / 100];
+    let p99 = values[n * 99 / 100];
+    let min = values[0];
+    let max = values[n - 1];
+
+    eprintln!();
+    eprintln!("=== {label} ===");
+    eprintln!("  samples: {n}");
+    eprintln!("  mean:    {mean:.1}{unit}");
+    eprintln!("  p50:     {p50:.1}{unit}");
+    eprintln!("  p95:     {p95:.1}{unit}");
+    eprintln!("  p99:     {p99:.1}{unit}");
+    eprintln!("  min:     {min:.1}{unit}");
+    eprintln!("  max:     {max:.1}{unit}");
+}
+
 // ---------------------------------------------------------------------------
 // Latency: single-byte round-trip through cat
 // ---------------------------------------------------------------------------
@@ -100,18 +118,16 @@ fn profile_roundtrip_latency() {
     const WARMUP: usize = 50;
     const ITERATIONS: usize = 500;
 
-    let mut latencies = Vec::with_capacity(ITERATIONS);
+    let mut latencies_us = Vec::with_capacity(ITERATIONS);
 
     for i in 0..(WARMUP + ITERATIONS) {
         let byte = b'A' + (i as u8 % 26);
 
         let start = Instant::now();
 
-        // Send one byte
         let pkt = mneme::protocol::Packet::content(&[byte]);
         mneme::protocol::send_packet(stream.as_fd(), &pkt).unwrap();
 
-        // Wait for echo
         loop {
             let resp = mneme::protocol::recv_packet(stream.as_fd()).unwrap();
             if resp.msg_type == mneme::protocol::MsgType::Content
@@ -122,51 +138,36 @@ fn profile_roundtrip_latency() {
         }
 
         let elapsed = start.elapsed();
-
         if i >= WARMUP {
-            latencies.push(elapsed);
+            latencies_us.push(elapsed.as_nanos() as f64 / 1000.0);
         }
     }
 
-    latencies.sort();
-
-    let sum: Duration = latencies.iter().sum();
-    let mean = sum / latencies.len() as u32;
-    let p50 = latencies[latencies.len() / 2];
-    let p95 = latencies[latencies.len() * 95 / 100];
-    let p99 = latencies[latencies.len() * 99 / 100];
-    let min = latencies[0];
-    let max = latencies[latencies.len() - 1];
-
-    eprintln!();
-    eprintln!("=== Round-trip latency (single byte through cat) ===");
-    eprintln!("  samples: {ITERATIONS} (after {WARMUP} warmup)");
-    eprintln!("  mean:    {:.1}µs", mean.as_nanos() as f64 / 1000.0);
-    eprintln!("  p50:     {:.1}µs", p50.as_nanos() as f64 / 1000.0);
-    eprintln!("  p95:     {:.1}µs", p95.as_nanos() as f64 / 1000.0);
-    eprintln!("  p99:     {:.1}µs", p99.as_nanos() as f64 / 1000.0);
-    eprintln!("  min:     {:.1}µs", min.as_nanos() as f64 / 1000.0);
-    eprintln!("  max:     {:.1}µs", max.as_nanos() as f64 / 1000.0);
+    print_stats(
+        "Round-trip latency (single byte through cat)",
+        "µs",
+        &mut latencies_us,
+    );
 
     drop(stream);
     kill_server(pid);
 }
 
 // ---------------------------------------------------------------------------
-// Throughput: large data transfer through cat
+// Throughput: child → client through mn
 // ---------------------------------------------------------------------------
 
 #[test]
 fn profile_throughput() {
-    // Measure sustained one-way throughput: child writes 16 MiB, client reads.
-    // Skip initial bytes to avoid measuring startup/buffering artifacts.
+    // Child produces continuous output. We take multiple 1 MiB windows,
+    // each timed independently, and report stats.
     let dir = TempDir::new().expect("tempdir");
     let session = format!("throughput-{}", std::process::id());
 
     let output = Command::new(mn_bin())
         .env("MNEME_SOCKET_DIR", dir.path())
         .args(["new", &session, "/bin/sh", "-c",
-               "sleep 2; dd if=/dev/zero bs=65536 count=256 2>/dev/null; sleep 60"])
+               "sleep 2; while true; do dd if=/dev/zero bs=65536 count=16 2>/dev/null; done"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -178,82 +179,73 @@ fn profile_throughput() {
     let socket = dir.path().join(&session);
     let pid = query_pid(&socket).expect("query PID");
     let stream = attach_live(&socket);
-
-    const TOTAL: usize = 65536 * 256; // 16 MiB
-    const SKIP: usize = 65536 * 16;   // skip first 1 MiB
-    let mut received = 0;
-    let mut total_wire = 0;
     stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
 
-    // Drain until we've skipped SKIP bytes (amortizes startup)
-    while total_wire < SKIP {
-        match mneme::protocol::recv_packet(stream.as_fd()) {
-            Ok(pkt) if pkt.msg_type == mneme::protocol::MsgType::Content => {
-                total_wire += pkt.payload.len();
+    const WINDOW: usize = 1024 * 1024; // 1 MiB per measurement
+    const WARMUP: usize = 2;
+    const ITERATIONS: usize = 10;
+
+    let mut rates = Vec::with_capacity(ITERATIONS);
+
+    for i in 0..(WARMUP + ITERATIONS) {
+        let mut received = 0;
+        let start = Instant::now();
+
+        while received < WINDOW {
+            match mneme::protocol::recv_packet(stream.as_fd()) {
+                Ok(pkt) if pkt.msg_type == mneme::protocol::MsgType::Content => {
+                    received += pkt.payload.len();
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!("recv error at {received}: {e}");
+                    break;
+                }
             }
-            Ok(_) => {}
-            Err(_) => break,
+        }
+
+        let elapsed = start.elapsed();
+        let mb_per_sec = (received as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
+
+        if i >= WARMUP {
+            rates.push(mb_per_sec);
         }
     }
 
-    // Now measure the rest
-    let start = Instant::now();
-    while received < (TOTAL - SKIP) {
-        match mneme::protocol::recv_packet(stream.as_fd()) {
-            Ok(pkt) if pkt.msg_type == mneme::protocol::MsgType::Content => {
-                received += pkt.payload.len();
-            }
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("recv error at {received}: {e}");
-                break;
-            }
-        }
-    }
-
-    let elapsed = start.elapsed();
-    let mb_per_sec = (received as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
-
-    eprintln!();
-    eprintln!("=== Throughput (16 MiB one-way, child → client) ===");
-    eprintln!("  received:  {} bytes", received);
-    eprintln!("  time:      {:.1}ms", elapsed.as_secs_f64() * 1000.0);
-    eprintln!("  rate:      {:.1} MiB/s", mb_per_sec);
+    print_stats(
+        "Throughput (1 MiB windows, child → client)",
+        " MiB/s",
+        &mut rates,
+    );
 
     drop(stream);
     kill_server(pid);
 }
 
 // ---------------------------------------------------------------------------
-// Baseline: direct PTY latency without mn (for comparison)
+// Baseline: direct PTY latency without mn
 // ---------------------------------------------------------------------------
 
 #[test]
 fn profile_baseline_pty_latency() {
-    // Open a PTY directly and run cat, measure echo latency without mn in the path.
     let mut leader: libc::c_int = -1;
     let mut follower: libc::c_int = -1;
-    let ret = unsafe {
+    assert_eq!(0, unsafe {
         libc::openpty(
-            &mut leader,
-            &mut follower,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
+            &mut leader, &mut follower,
+            std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
         )
-    };
-    assert_eq!(ret, 0, "openpty failed");
+    });
 
     let leader_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(leader) };
     let follower_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(follower) };
 
-    // Spawn cat on the follower
-    let follower_clone1 = follower_fd.try_clone().unwrap();
-    let follower_clone2 = follower_fd.try_clone().unwrap();
+    let fc1 = follower_fd.try_clone().unwrap();
+    let fc2 = follower_fd.try_clone().unwrap();
     let mut child = Command::new("cat")
         .stdin(Stdio::from(follower_fd))
-        .stdout(Stdio::from(follower_clone1))
-        .stderr(Stdio::from(follower_clone2))
+        .stdout(Stdio::from(fc1))
+        .stderr(Stdio::from(fc2))
         .spawn()
         .expect("spawn cat");
 
@@ -264,7 +256,7 @@ fn profile_baseline_pty_latency() {
 
     const WARMUP: usize = 50;
     const ITERATIONS: usize = 500;
-    let mut latencies = Vec::with_capacity(ITERATIONS);
+    let mut latencies_us = Vec::with_capacity(ITERATIONS);
 
     for i in 0..(WARMUP + ITERATIONS) {
         let byte = b'A' + (i as u8 % 26);
@@ -277,109 +269,102 @@ fn profile_baseline_pty_latency() {
         leader_file.read_exact(&mut buf).unwrap();
 
         let elapsed = start.elapsed();
-
         if i >= WARMUP {
-            latencies.push(elapsed);
+            latencies_us.push(elapsed.as_nanos() as f64 / 1000.0);
         }
     }
 
-    latencies.sort();
-    let sum: Duration = latencies.iter().sum();
-    let mean = sum / latencies.len() as u32;
-    let p50 = latencies[latencies.len() / 2];
-    let p95 = latencies[latencies.len() * 95 / 100];
-    let p99 = latencies[latencies.len() * 99 / 100];
-
-    eprintln!();
-    eprintln!("=== Baseline PTY latency (cat, no mn) ===");
-    eprintln!("  samples: {ITERATIONS} (after {WARMUP} warmup)");
-    eprintln!("  mean:    {:.1}µs", mean.as_nanos() as f64 / 1000.0);
-    eprintln!("  p50:     {:.1}µs", p50.as_nanos() as f64 / 1000.0);
-    eprintln!("  p95:     {:.1}µs", p95.as_nanos() as f64 / 1000.0);
-    eprintln!("  p99:     {:.1}µs", p99.as_nanos() as f64 / 1000.0);
+    print_stats(
+        "Baseline PTY latency (cat, no mn)",
+        "µs",
+        &mut latencies_us,
+    );
 
     let _ = child.kill();
     let _ = child.wait();
 }
 
+// ---------------------------------------------------------------------------
+// Baseline: direct PTY throughput without mn
+// ---------------------------------------------------------------------------
+
 #[test]
 fn profile_baseline_pty_throughput() {
-    // Write 16 MiB through a raw PTY using dd — no mn in the path.
+    // Run dd in a loop, take multiple 1 MiB windows.
     let mut leader: libc::c_int = -1;
     let mut follower: libc::c_int = -1;
-    let ret = unsafe {
+    assert_eq!(0, unsafe {
         libc::openpty(
-            &mut leader,
-            &mut follower,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
+            &mut leader, &mut follower,
+            std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
         )
-    };
-    assert_eq!(ret, 0, "openpty failed");
+    });
 
     let leader_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(leader) };
     let follower_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(follower) };
 
-    let follower_clone1 = follower_fd.try_clone().unwrap();
-    let follower_clone2 = follower_fd.try_clone().unwrap();
+    let fc1 = follower_fd.try_clone().unwrap();
+    let fc2 = follower_fd.try_clone().unwrap();
     let mut child = Command::new("/bin/sh")
-        .args(["-c", "dd if=/dev/zero bs=65536 count=256 2>/dev/null"])
+        .args(["-c", "while true; do dd if=/dev/zero bs=65536 count=16 2>/dev/null; done"])
         .stdin(Stdio::from(follower_fd))
-        .stdout(Stdio::from(follower_clone1))
-        .stderr(Stdio::from(follower_clone2))
+        .stdout(Stdio::from(fc1))
+        .stderr(Stdio::from(fc2))
         .spawn()
         .expect("spawn dd");
 
-    use std::os::fd::IntoRawFd;
     use std::io::Read;
+    use std::os::fd::{AsRawFd, IntoRawFd};
 
     unsafe {
         let flags = libc::fcntl(leader_fd.as_raw_fd(), libc::F_GETFL);
         libc::fcntl(leader_fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
 
-    use std::os::fd::AsRawFd;
     let raw_fd = leader_fd.as_raw_fd();
     let mut leader_file = unsafe { std::fs::File::from_raw_fd(leader_fd.into_raw_fd()) };
 
-    const TOTAL: usize = 65536 * 256; // 16 MiB
-    let mut received = 0;
+    const WINDOW: usize = 1024 * 1024; // 1 MiB per measurement
+    const WARMUP: usize = 2;
+    const ITERATIONS: usize = 10;
     let mut buf = [0u8; 65536];
+    let mut rates = Vec::with_capacity(ITERATIONS);
 
-    let start = Instant::now();
+    for i in 0..(WARMUP + ITERATIONS) {
+        let mut received = 0;
+        let start = Instant::now();
 
-    while received < TOTAL {
-        // Use poll to wait for data
-        let mut pfd = libc::pollfd {
-            fd: raw_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ret = unsafe { libc::poll(&mut pfd, 1, 5000) };
-        if ret <= 0 {
-            break;
-        }
-        match leader_file.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => received += n,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-            Err(e) if e.raw_os_error() == Some(libc::EIO) => break, // child exited
-            Err(e) => {
-                eprintln!("read error: {e}");
+        while received < WINDOW {
+            let mut pfd = libc::pollfd {
+                fd: raw_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut pfd, 1, 5000) } <= 0 {
                 break;
             }
+            match leader_file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => received += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) if e.raw_os_error() == Some(libc::EIO) => break,
+                Err(_) => break,
+            }
+        }
+
+        let elapsed = start.elapsed();
+        let mb_per_sec = (received as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
+
+        if i >= WARMUP {
+            rates.push(mb_per_sec);
         }
     }
 
-    let elapsed = start.elapsed();
-    let mb_per_sec = (received as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
-
-    eprintln!();
-    eprintln!("=== Baseline PTY throughput (16 MiB one-way, no mn) ===");
-    eprintln!("  received:  {} bytes", received);
-    eprintln!("  time:      {:.1}ms", elapsed.as_secs_f64() * 1000.0);
-    eprintln!("  rate:      {:.1} MiB/s", mb_per_sec);
+    print_stats(
+        "Baseline PTY throughput (1 MiB windows, no mn)",
+        " MiB/s",
+        &mut rates,
+    );
 
     let _ = child.kill();
     let _ = child.wait();
