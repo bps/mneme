@@ -52,20 +52,18 @@ pub fn socket_dir() -> Result<PathBuf, io::Error> {
             true,
             false,
         ),
-        (
-            dirs_home().map(|d| d.join(".mneme")).unwrap_or_default(),
-            true,
-            false,
-        ),
+        // macOS: TMPDIR is per-user and cleaned on reboot — correct
+        // place for runtime sockets when XDG_RUNTIME_DIR is unset.
         (
             std::env::var("TMPDIR")
                 .ok()
                 .filter(|s| !s.is_empty())
                 .map(|d| PathBuf::from(d).join("mneme"))
                 .unwrap_or_default(),
-            false,
+            true,  // TMPDIR on macOS is already per-user (/var/folders/.../T/)
             false,
         ),
+        // Last resort: shared /tmp with per-uid subdirectory
         (PathBuf::from("/tmp/mneme"), false, false),
     ];
 
@@ -237,12 +235,6 @@ fn verify_dir_fd(fd: &OwnedFd, expected_uid: u32) -> io::Result<()> {
     Ok(())
 }
 
-fn dirs_home() -> Option<PathBuf> {
-    std::env::var("HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-}
 
 // ---------------------------------------------------------------------------
 // Tests
