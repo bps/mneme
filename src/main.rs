@@ -338,7 +338,18 @@ fn attach_session(opts: &CliOpts) -> Result<i32, Box<dyn std::error::Error>> {
 
 fn session_exists(name: &str) -> Result<bool, Box<dyn std::error::Error>> {
     let path = socket::socket_path(name)?;
-    Ok(path.exists())
+    if !path.exists() {
+        return Ok(false);
+    }
+    // Verify the session is actually alive by trying to connect
+    match std::os::unix::net::UnixStream::connect(&path) {
+        Ok(_) => Ok(true),
+        Err(_) => {
+            // Stale socket — clean it up
+            let _ = std::fs::remove_file(&path);
+            Ok(false)
+        }
+    }
 }
 
 fn list_sessions() -> Result<(), Box<dyn std::error::Error>> {
