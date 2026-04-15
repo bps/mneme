@@ -52,6 +52,46 @@ fn open_pty() -> io::Result<(OwnedFd, OwnedFd)> {
     unsafe { Ok((OwnedFd::from_raw_fd(leader), OwnedFd::from_raw_fd(follower))) }
 }
 
+/// Check that the peer on the other end of a Unix socket is the same UID as us.
+/// Returns Ok(()) if the peer matches, Err if not or if the check fails.
+#[cfg(target_os = "macos")]
+fn verify_peer_uid(fd: &OwnedFd) -> io::Result<()> {
+    let my_uid = rustix::process::getuid().as_raw();
+    let mut peer_uid: libc::uid_t = 0;
+    let mut peer_gid: libc::gid_t = 0;
+    let ret = unsafe { libc::getpeereid(fd.as_raw_fd(), &mut peer_uid, &mut peer_gid) };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if peer_uid != my_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("peer uid {peer_uid} does not match server uid {my_uid}"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_peer_uid(fd: &OwnedFd) -> io::Result<()> {
+    let my_uid = rustix::process::getuid().as_raw();
+    let cred = rustix::net::sockopt::get_socket_peercred(fd)?;
+    let peer_uid = cred.uid;
+    if peer_uid != my_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("peer uid {peer_uid} does not match server uid {my_uid}"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn verify_peer_uid(_fd: &OwnedFd) -> io::Result<()> {
+    // No peer credential check available on this platform
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Client state on the server side
 // ---------------------------------------------------------------------------
@@ -426,9 +466,14 @@ fn server_mainloop(
         // Accept new clients
         if revents[0].contains(PollFlags::IN) {
             if let Ok((stream, _)) = listener.accept() {
-                stream.set_nonblocking(true).ok();
                 let fd = OwnedFd::from(stream);
-                clients.push(ServerClient::new(fd));
+                // Verify peer UID before accepting
+                if verify_peer_uid(&fd).is_err() {
+                    drop(fd); // reject connection
+                } else {
+                    rustix::fs::fcntl_setfl(&fd, rustix::fs::OFlags::NONBLOCK).ok();
+                    clients.push(ServerClient::new(fd));
+                }
             }
         }
 
