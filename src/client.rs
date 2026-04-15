@@ -69,7 +69,13 @@ pub fn attach(
     stream.set_nonblocking(true)?;
 
     // Set terminal to raw mode (if stdin is a tty)
-    let _raw_guard = RawTerminal::enter().ok();
+    let _raw_guard = match RawTerminal::enter() {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            eprintln!("mn: warning: could not set raw mode: {e}");
+            None
+        }
+    };
 
     // Run the client event loop
     client_mainloop(stream, detach_key, flags)
@@ -235,8 +241,13 @@ fn client_mainloop(
                 Err(_) => return Ok(AttachResult::Detached), // stdin closed
             };
 
-            // Check for detach key
-            if n == 1 && read_buf[0] == detach_key {
+            // Check for detach key anywhere in the input
+            if let Some(pos) = read_buf[..n].iter().position(|&b| b == detach_key) {
+                // Send any bytes before the detach key
+                if pos > 0 && !flags.contains(ClientFlags::READONLY) {
+                    let pkt = Packet::content(&read_buf[..pos]);
+                    let _ = protocol::send_packet(stream.as_fd(), &pkt);
+                }
                 let pkt = Packet::empty(MsgType::Detach);
                 let _ = protocol::send_packet(stream.as_fd(), &pkt);
                 return Ok(AttachResult::Detached);
