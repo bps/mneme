@@ -135,24 +135,14 @@ impl RawTerminal {
 
 impl Drop for RawTerminal {
     fn drop(&mut self) {
-        // Exit alternate screen — terminal emulator restores the saved
-        // screen, cursor position, and cursor visibility automatically.
-        // Also explicitly reset modes that live outside the alt screen:
+        // Pop kitty keyboard protocol — this mode stack lives outside
+        // the alternate screen, so the terminal won't restore it for us.
+        // Then exit alternate screen — the terminal emulator restores
+        // the saved screen, cursor, attributes, and all DEC private modes.
         let stdout = io::stdout();
         let _ = protocol::write_all_fd(
             stdout.as_fd(),
-            concat!(
-                "\x1b[?25h",    // show cursor
-                "\x1b[0m",      // reset text attributes
-                "\x1b[<u",      // pop kitty keyboard protocol
-                "\x1b[?1049l",  // exit alternate screen (restores saved state)
-                "\x1b[?2004l",  // disable bracketed paste
-                "\x1b[?1000l",  // disable mouse (X11 basic)
-                "\x1b[?1002l",  // disable mouse (button-event)
-                "\x1b[?1003l",  // disable mouse (any-event)
-                "\x1b[?1006l",  // disable mouse (SGR encoding)
-            )
-            .as_bytes(),
+            b"\x1b[<u\x1b[?1049l",
         );
 
         let stdin = io::stdin();
