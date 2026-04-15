@@ -195,7 +195,7 @@ impl Packet {
     }
 
     pub fn parse_welcome(&self) -> Option<Welcome> {
-        if self.msg_type != MsgType::Welcome || self.payload.len() < 20 {
+        if self.msg_type != MsgType::Welcome || self.payload.len() < 21 {
             return None;
         }
         let p = &self.payload;
@@ -283,6 +283,7 @@ pub fn write_all_fd(fd: BorrowedFd<'_>, mut buf: &[u8]) -> io::Result<()> {
 
 /// Read exactly `buf.len()` bytes from fd. Returns Ok(()) or error.
 /// Returns UnexpectedEof if the fd closes before all bytes are read.
+/// Returns WouldBlock if no data is available (non-blocking fd).
 pub fn read_exact_fd(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<()> {
     let mut pos = 0;
     while pos < buf.len() {
@@ -290,6 +291,14 @@ pub fn read_exact_fd(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<()> {
             Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
             Ok(n) => pos += n,
             Err(rustix::io::Errno::INTR) => continue,
+            Err(rustix::io::Errno::AGAIN) => {
+                if pos == 0 {
+                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                }
+                // Partial read: keep trying (data is in-flight)
+                std::thread::yield_now();
+                continue;
+            }
             Err(e) => return Err(e.into()),
         }
     }

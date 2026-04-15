@@ -32,8 +32,8 @@ pub fn validate_session_name(name: &str) -> Result<(), String> {
 pub fn socket_dir() -> Result<PathBuf, io::Error> {
     let uid = rustix::process::getuid().as_raw();
 
-    let candidates: Vec<(PathBuf, bool)> = vec![
-        // (path, is_personal) — personal dirs are 0700, shared need uid subdir
+    let candidates: Vec<(PathBuf, bool, bool)> = vec![
+        // (path, is_personal, is_explicit) — explicit dirs skip permission checks
         (
             std::env::var("MNEME_SOCKET_DIR")
                 .ok()
@@ -41,6 +41,7 @@ pub fn socket_dir() -> Result<PathBuf, io::Error> {
                 .map(PathBuf::from)
                 .unwrap_or_default(),
             true,
+            true, // user explicitly set this — trust it
         ),
         (
             std::env::var("XDG_RUNTIME_DIR")
@@ -48,11 +49,13 @@ pub fn socket_dir() -> Result<PathBuf, io::Error> {
                 .filter(|s| !s.is_empty())
                 .map(|d| PathBuf::from(d).join("mneme"))
                 .unwrap_or_default(),
-            true, // XDG_RUNTIME_DIR is already per-user
+            true,
+            false,
         ),
         (
             dirs_home().map(|d| d.join(".mneme")).unwrap_or_default(),
             true,
+            false,
         ),
         (
             std::env::var("TMPDIR")
@@ -61,20 +64,28 @@ pub fn socket_dir() -> Result<PathBuf, io::Error> {
                 .map(|d| PathBuf::from(d).join("mneme"))
                 .unwrap_or_default(),
             false,
+            false,
         ),
-        (PathBuf::from("/tmp/mneme"), false),
+        (PathBuf::from("/tmp/mneme"), false, false),
     ];
 
-    for (base, personal) in candidates {
+    for (base, personal, explicit) in candidates {
         if base.as_os_str().is_empty() {
             continue;
         }
 
         if personal {
-            // Single directory: create and verify in one shot
-            match ensure_safe_dir(&base, uid, Mode::RWXU) {
-                Ok(()) => return Ok(base),
-                Err(_) => continue,
+            if explicit {
+                // User-provided dir: just ensure it exists and is a directory
+                match ensure_dir_exists(&base) {
+                    Ok(()) => return Ok(base),
+                    Err(_) => continue,
+                }
+            } else {
+                match ensure_safe_dir(&base, uid, Mode::RWXU) {
+                    Ok(()) => return Ok(base),
+                    Err(_) => continue,
+                }
             }
         } else {
             // Shared base + per-uid subdir
@@ -106,6 +117,23 @@ pub fn socket_path(name: &str) -> Result<PathBuf, io::Error> {
 // ---------------------------------------------------------------------------
 // Safe directory operations using openat/fstat (no TOCTOU)
 // ---------------------------------------------------------------------------
+
+/// Ensure a directory exists (create if needed). No ownership/permission checks.
+/// Used for explicitly user-provided directories (MNEME_SOCKET_DIR).
+fn ensure_dir_exists(path: &Path) -> io::Result<()> {
+    match std::fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            // Verify it's actually a directory
+            if path.is_dir() {
+                Ok(())
+            } else {
+                Err(io::Error::new(io::ErrorKind::Other, "not a directory"))
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
 
 /// Ensure a directory exists, is owned by `expected_uid`, and has the
 /// given mode. For the leaf directory: uses open(O_DIRECTORY|O_NOFOLLOW)
