@@ -152,7 +152,7 @@ impl ServerClient {
                     return true; // can't write more right now
                 }
                 protocol::WriteResult::WouldBlock => return true,
-                protocol::WriteResult::Error(_) => return false,
+                protocol::WriteResult::Error => return false,
             }
         }
         true
@@ -168,7 +168,6 @@ impl ServerClient {
 // ---------------------------------------------------------------------------
 
 struct ServerOpts {
-    session_name: String,
     ready_fd: i32,
     rows: u16,
     cols: u16,
@@ -188,7 +187,7 @@ fn parse_server_args(args: &[String]) -> Result<ServerOpts, String> {
     if args.is_empty() {
         return Err("--server requires a session name".into());
     }
-    let session_name = args[0].clone();
+    let _session_name = args[0].clone();
     let mut i = 1;
     let mut past_separator = false;
 
@@ -249,7 +248,6 @@ fn parse_server_args(args: &[String]) -> Result<ServerOpts, String> {
     }
 
     Ok(ServerOpts {
-        session_name,
         ready_fd: ready_fd.ok_or("--ready-fd is required")?,
         rows,
         cols,
@@ -841,25 +839,6 @@ fn handle_child_exit(
 // ---------------------------------------------------------------------------
 // Controller election
 // ---------------------------------------------------------------------------
-
-fn elect_controller(clients: &mut [ServerClient]) {
-    // Clear all controller flags first
-    for c in clients.iter_mut() {
-        c.is_controller = false;
-    }
-    // Elect the most recently added, eligible, live client
-    for c in clients.iter_mut().rev() {
-        if c.state == ClientState::Live
-            && !c.flags.contains(ClientFlags::READONLY)
-            && !c.flags.contains(ClientFlags::LOW_PRIORITY)
-        {
-            c.is_controller = true;
-            let pkt = Packet::empty(MsgType::ResizeReq);
-            c.queue_packet(&pkt);
-            return;
-        }
-    }
-}
 
 fn remove_clients(clients: &mut Vec<ServerClient>, indices: &[usize]) {
     if indices.is_empty() {

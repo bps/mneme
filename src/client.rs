@@ -243,7 +243,7 @@ fn client_mainloop(
 
                 // Check for detach key: raw byte or CSI u encoded
                 let detach_pos = find_detach_key(&read_buf[..n], detach_key, &csi_u_detach);
-                if let Some((pos, len)) = detach_pos {
+                if let Some((pos, _len)) = detach_pos {
                     // Send any bytes before the detach key
                     if pos > 0 && !flags.contains(ClientFlags::READONLY) {
                         let pkt = Packet::content(&read_buf[..pos]);

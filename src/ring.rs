@@ -41,6 +41,7 @@ impl RingBuffer {
     }
 
     /// True if the buffer is empty.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -115,6 +116,7 @@ impl RingBuffer {
     }
 
     /// Clear the buffer.
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.head = 0;
         self.tail = 0;

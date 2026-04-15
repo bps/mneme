@@ -6,7 +6,7 @@ mod socket;
 
 use clap::{Parser, Subcommand};
 use std::env;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::process;
 
 fn main() {

@@ -8,7 +8,6 @@ use std::os::fd::BorrowedFd;
 pub const PROTOCOL_VERSION: u8 = 1;
 pub const HEADER_SIZE: usize = 3; // type(1) + len(2)
 pub const MAX_PAYLOAD: usize = 4093;
-pub const MAX_PACKET: usize = HEADER_SIZE + MAX_PAYLOAD;
 
 // ---------------------------------------------------------------------------
 // Message types
@@ -250,17 +249,6 @@ impl Packet {
         buf.extend_from_slice(&self.payload);
         buf
     }
-
-    /// Encode directly into a provided buffer. Returns the number of bytes written.
-    pub fn encode_into(&self, buf: &mut [u8]) -> usize {
-        let len = self.payload.len() as u16;
-        let total = HEADER_SIZE + self.payload.len();
-        debug_assert!(buf.len() >= total);
-        buf[0] = self.msg_type as u8;
-        buf[1..3].copy_from_slice(&len.to_le_bytes());
-        buf[HEADER_SIZE..total].copy_from_slice(&self.payload);
-        total
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -348,7 +336,7 @@ pub enum WriteResult {
     /// Would block — nothing written, buffer everything.
     WouldBlock,
     /// Peer gone or fatal error.
-    Error(io::Error),
+    Error,
 }
 
 /// Attempt a non-blocking write. Does NOT retry on EAGAIN.
@@ -357,7 +345,7 @@ pub fn try_write(fd: BorrowedFd<'_>, buf: &[u8]) -> WriteResult {
     while written < buf.len() {
         match rustix::io::write(fd, &buf[written..]) {
             Ok(0) => {
-                return WriteResult::Error(io::Error::from(io::ErrorKind::WriteZero));
+                return WriteResult::Error;
             }
             Ok(n) => written += n,
             Err(rustix::io::Errno::AGAIN) => {
@@ -367,7 +355,7 @@ pub fn try_write(fd: BorrowedFd<'_>, buf: &[u8]) -> WriteResult {
                 return WriteResult::WouldBlock;
             }
             Err(rustix::io::Errno::INTR) => continue,
-            Err(e) => return WriteResult::Error(e.into()),
+            Err(_) => return WriteResult::Error,
         }
     }
     WriteResult::Complete

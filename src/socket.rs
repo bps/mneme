@@ -1,5 +1,5 @@
 use std::io;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
 use rustix::fs::{self, AtFlags, Mode, OFlags, CWD};
