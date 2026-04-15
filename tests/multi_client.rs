@@ -26,7 +26,7 @@ fn start_session(prefix: &str, shell_cmd: &str) -> (TempDir, String, u32) {
 
     let output = Command::new(mn_bin())
         .env("MNEME_SOCKET_DIR", dir.path())
-        .args(["-n", &session, "/bin/sh", "-c", shell_cmd])
+        .args(["new", &session, "/bin/sh", "-c", shell_cmd])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

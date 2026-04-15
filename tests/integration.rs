@@ -233,7 +233,7 @@ fn create_only_and_list() {
     let env = TestEnv::new();
     let sess = env.session("create-list");
 
-    let r = env.run(&["-n", &sess, "/bin/sh", "-c", "sleep 60"], 5);
+    let r = env.run(&["new", &sess, "/bin/sh", "-c", "sleep 60"], 5);
     assert_eq!(r.code, 0, "create failed: {}", r.stderr);
     assert!(r.stderr.contains("session created"), "stderr: {}", r.stderr);
 
@@ -251,7 +251,7 @@ fn create_attach_detach() {
     let sess = env.session("create-attach");
 
     // Spawn mn -c, wait for output, then send detach key
-    let mut child = env.spawn(&["-c", &sess, "/bin/sh", "-c", "echo HELLO_WORLD; sleep 60"]);
+    let mut child = env.spawn(&["create", &sess, "/bin/sh", "-c", "echo HELLO_WORLD; sleep 60"]);
 
     std::thread::sleep(Duration::from_secs(1));
 
@@ -272,7 +272,7 @@ fn replay_on_reattach() {
     let sess = env.session("replay");
 
     let r = env.run_with_stdin(
-        &["-c", &sess, "/bin/sh", "-c", "echo LINE_ONE; echo LINE_TWO; echo LINE_THREE; sleep 60"],
+        &["create", &sess, "/bin/sh", "-c", "echo LINE_ONE; echo LINE_TWO; echo LINE_THREE; sleep 60"],
         Some(DETACH),
         5,
     );
@@ -280,7 +280,7 @@ fn replay_on_reattach() {
 
     std::thread::sleep(Duration::from_millis(500));
 
-    let r = env.run_with_stdin(&["-a", &sess], Some(DETACH), 5);
+    let r = env.run_with_stdin(&["attach", &sess], Some(DETACH), 5);
     assert_eq!(r.code, 0, "reattach failed: {}", r.stderr);
     assert!(r.stdout.contains("LINE_ONE"), "replay missing LINE_ONE: stdout='{}'", r.stdout);
     assert!(r.stdout.contains("LINE_TWO"), "replay missing LINE_TWO: stdout='{}'", r.stdout);
@@ -292,7 +292,7 @@ fn fast_exit_child() {
     let env = TestEnv::new();
     let sess = env.session("fast-exit");
 
-    let r = env.run(&["-c", &sess, "/usr/bin/true"], 5);
+    let r = env.run(&["create", &sess, "/usr/bin/true"], 5);
     assert_eq!(r.code, 0, "fast exit failed: {}", r.stderr);
     assert!(r.stderr.contains("exit status 0"), "wrong exit message: {}", r.stderr);
 }
@@ -302,7 +302,7 @@ fn fast_exit_child_nonzero() {
     let env = TestEnv::new();
     let sess = env.session("fast-exit-nz");
 
-    let r = env.run(&["-c", &sess, "/usr/bin/false"], 5);
+    let r = env.run(&["create", &sess, "/usr/bin/false"], 5);
     assert_eq!(r.code, 1, "expected exit code 1, got {}: {}", r.code, r.stderr);
     assert!(r.stderr.contains("exit status 1"), "wrong exit message: {}", r.stderr);
 }
@@ -313,7 +313,7 @@ fn attach_or_create_new() {
     let sess = env.session("aoc-new");
 
     let r = env.run_with_stdin(
-        &["-A", &sess, "/bin/sh", "-c", "echo FRESH; sleep 60"],
+        &["auto", &sess, "/bin/sh", "-c", "echo FRESH; sleep 60"],
         Some(DETACH),
         5,
     );
@@ -326,11 +326,11 @@ fn attach_or_create_existing() {
     let env = TestEnv::new();
     let sess = env.session("aoc-exist");
 
-    let r = env.run(&["-n", &sess, "/bin/sh", "-c", "echo EXISTS; sleep 60"], 5);
+    let r = env.run(&["new", &sess, "/bin/sh", "-c", "echo EXISTS; sleep 60"], 5);
     assert_eq!(r.code, 0, "create failed: {}", r.stderr);
     std::thread::sleep(Duration::from_millis(500));
 
-    let r = env.run_with_stdin(&["-A", &sess], Some(DETACH), 5);
+    let r = env.run_with_stdin(&["auto", &sess], Some(DETACH), 5);
     assert_eq!(r.code, 0, "-A existing failed: {}", r.stderr);
     assert!(!r.stderr.contains("session created"), "should not re-create: {}", r.stderr);
     assert!(r.stderr.contains("detached"), "should detach: {}", r.stderr);
@@ -341,17 +341,17 @@ fn force_recreate() {
     let env = TestEnv::new();
     let sess = env.session("force");
 
-    let r = env.run(&["-n", &sess, "/bin/sh", "-c", "sleep 60"], 5);
+    let r = env.run(&["new", &sess, "/bin/sh", "-c", "sleep 60"], 5);
     assert_eq!(r.code, 0, "first create failed: {}", r.stderr);
     std::thread::sleep(Duration::from_millis(500));
 
     // Without -f, should fail
-    let r = env.run(&["-n", &sess, "/bin/sh", "-c", "sleep 60"], 5);
+    let r = env.run(&["new", &sess, "/bin/sh", "-c", "sleep 60"], 5);
     assert_ne!(r.code, 0, "duplicate create should fail");
     assert!(r.stderr.contains("already exists"), "wrong error: {}", r.stderr);
 
     // With -f, should succeed
-    let r = env.run(&["-f", "-n", &sess, "/bin/sh", "-c", "sleep 60"], 5);
+    let r = env.run(&["new", "-f", &sess, "/bin/sh", "-c", "sleep 60"], 5);
     assert_eq!(r.code, 0, "force create failed: {}", r.stderr);
 }
 
@@ -360,7 +360,7 @@ fn quiet_mode() {
     let env = TestEnv::new();
     let sess = env.session("quiet");
 
-    let r = env.run(&["-q", "-n", &sess, "/bin/sh", "-c", "sleep 60"], 5);
+    let r = env.run(&["new", "-q", &sess, "/bin/sh", "-c", "sleep 60"], 5);
     assert_eq!(r.code, 0, "quiet create failed: {}", r.stderr);
     assert!(r.stderr.is_empty(), "quiet mode should suppress stderr: '{}'", r.stderr);
 }
@@ -370,7 +370,7 @@ fn session_cleanup_after_exit() {
     let env = TestEnv::new();
     let sess = env.session("cleanup");
 
-    let r = env.run(&["-c", &sess, "/usr/bin/true"], 5);
+    let r = env.run(&["create", &sess, "/usr/bin/true"], 5);
     assert!(r.stderr.contains("exit status 0"), "wrong exit: {}", r.stderr);
 
     // Server should have exited — session gone from list
@@ -382,7 +382,7 @@ fn session_cleanup_after_exit() {
 #[test]
 fn invalid_session_name_rejected() {
     let env = TestEnv::new();
-    let r = env.run(&["-c", "bad/name", "/bin/sh"], 5);
+    let r = env.run(&["create", "bad/name", "/bin/sh"], 5);
     assert_ne!(r.code, 0);
     assert!(r.stderr.contains("alphanumeric"), "wrong error: {}", r.stderr);
 }
@@ -390,22 +390,31 @@ fn invalid_session_name_rejected() {
 #[test]
 fn attach_nonexistent_fails() {
     let env = TestEnv::new();
-    let r = env.run(&["-a", "does-not-exist-99999"], 5);
+    let r = env.run(&["attach", "does-not-exist-99999"], 5);
     assert_ne!(r.code, 0, "should fail: {}", r.stderr);
 }
 
 #[test]
-fn mutual_exclusion() {
+fn unknown_subcommand_rejected() {
     let env = TestEnv::new();
-    let r = env.run(&["-c", "-a", "test"], 5);
+    let r = env.run(&["bogus"], 5);
     assert_ne!(r.code, 0);
-    assert!(r.stderr.contains("cannot be used with"), "wrong error: {}", r.stderr);
+    assert!(
+        r.stderr.contains("invalid") || r.stderr.contains("unrecognized"),
+        "wrong error: {}",
+        r.stderr
+    );
 }
 
 #[test]
 fn missing_session_name() {
     let env = TestEnv::new();
-    let r = env.run(&["-c"], 5);
+    let r = env.run(&["create"], 5);
     assert_ne!(r.code, 0);
-    assert!(r.stderr.contains("session name"), "wrong error: {}", r.stderr);
+    // clap reports this as a missing required argument
+    assert!(
+        r.stderr.contains("<NAME>") || r.stderr.contains("required"),
+        "wrong error: {}",
+        r.stderr
+    );
 }

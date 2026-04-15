@@ -35,7 +35,7 @@ impl ServerFixture {
 
         let mut cmd = Command::new(mn_bin());
         cmd.env("MNEME_SOCKET_DIR", dir.path())
-            .args(["-n", &session, "/bin/sh", "-c", "sleep 300"])
+            .args(["new", &session, "/bin/sh", "-c", "sleep 300"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
