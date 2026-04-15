@@ -133,15 +133,22 @@ impl Drop for RawTerminal {
             &self.orig,
         );
         // Reset terminal modes that TUI apps may have enabled via escape
-        // sequences (these aren't covered by termios restore):
-        //   - Kitty keyboard protocol: pop mode
-        //   - Alternate screen: exit
-        //   - Bracketed paste: disable
-        //   - Mouse reporting: disable all common modes
+        // sequences (these aren't covered by termios restore).
         let stdout = io::stdout();
         let _ = protocol::write_all_fd(
             stdout.as_fd(),
-            b"\x1b[<u\x1b[?1049l\x1b[?2004l\x1b[?1000l\x1b[?1006l",
+            concat!(
+                "\x1b[?25h",    // show cursor (DECTCEM)
+                "\x1b[0m",      // reset text attributes (SGR)
+                "\x1b[<u",      // pop kitty keyboard protocol
+                "\x1b[?1049l",  // exit alternate screen
+                "\x1b[?2004l",  // disable bracketed paste
+                "\x1b[?1000l",  // disable mouse (X11 basic)
+                "\x1b[?1002l",  // disable mouse (button-event)
+                "\x1b[?1003l",  // disable mouse (any-event)
+                "\x1b[?1006l",  // disable mouse (SGR encoding)
+            )
+            .as_bytes(),
         );
     }
 }
