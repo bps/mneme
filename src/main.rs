@@ -67,6 +67,10 @@ enum Cmd {
     /// List active sessions.
     #[command(alias = "ls")]
     List,
+
+    /// Kill a session (terminates the server and child process).
+    #[command(alias = "rm")]
+    Kill(KillOpts),
 }
 
 // -- Shared option groups ---------------------------------------------------
@@ -168,6 +172,16 @@ struct AttachOpts {
 }
 
 #[derive(Parser, Debug)]
+struct KillOpts {
+    /// Session name (or "all" to kill every session).
+    name: String,
+
+    /// Suppress informational messages.
+    #[arg(short = 'q')]
+    quiet: bool,
+}
+
+#[derive(Parser, Debug)]
 struct AutoOpts {
     /// Session name.
     name: String,
@@ -232,6 +246,14 @@ fn run_cli(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
             } else {
                 do_create(&opts.name, &opts.command, opts.ring_size, opts.force, opts.quiet)?;
                 do_attach(&opts.name, opts.detach_key, opts.readonly, opts.low_priority, opts.quiet)
+            }
+        }
+        Some(Cmd::Kill(opts)) => {
+            if opts.name == "all" {
+                do_kill_all(opts.quiet)
+            } else {
+                socket::validate_session_name(&opts.name)?;
+                do_kill(&opts.name, opts.quiet)
             }
         }
     }
@@ -408,6 +430,80 @@ fn session_exists(name: &str) -> Result<bool, Box<dyn std::error::Error>> {
             Ok(false)
         }
     }
+}
+
+fn do_kill(name: &str, quiet: bool) -> Result<i32, Box<dyn std::error::Error>> {
+    let path = socket::socket_path(name)?;
+    let welcome = match query_session(&path) {
+        Ok(w) => w,
+        Err(_) => {
+            // Socket exists but server isn't responding — clean up stale socket
+            if path.exists() {
+                let _ = std::fs::remove_file(&path);
+                if !quiet {
+                    eprintln!("mn: {name}: removed stale socket");
+                }
+                return Ok(0);
+            }
+            return Err(format!("session '{name}' not found").into());
+        }
+    };
+
+    // Kill the server process
+    let pid = welcome.server_pid as libc::pid_t;
+    let ret = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if ret != 0 {
+        return Err(format!("failed to kill server (pid {pid}): {}",
+            std::io::Error::last_os_error()).into());
+    }
+
+    // Wait briefly for cleanup
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // Remove socket if still present
+    let _ = std::fs::remove_file(&path);
+
+    if !quiet {
+        eprintln!("mn: {name}: killed");
+    }
+    Ok(0)
+}
+
+fn do_kill_all(quiet: bool) -> Result<i32, Box<dyn std::error::Error>> {
+    let dir = socket::socket_dir()?;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+
+    let mut count = 0;
+    for entry in entries {
+        let entry = entry?;
+        use std::os::unix::fs::FileTypeExt;
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.file_type().is_socket() {
+            continue;
+        }
+
+        let name = entry.file_name().to_string_lossy().to_string();
+        match do_kill(&name, quiet) {
+            Ok(_) => count += 1,
+            Err(e) => {
+                if !quiet {
+                    eprintln!("mn: {name}: {e}");
+                }
+            }
+        }
+    }
+
+    if !quiet && count == 0 {
+        eprintln!("mn: no sessions to kill");
+    }
+    Ok(0)
 }
 
 fn list_sessions() -> Result<(), Box<dyn std::error::Error>> {
