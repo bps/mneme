@@ -569,11 +569,34 @@ fn server_mainloop(
             }
         }
 
-        // Handle controller changes before removal
-        let had_controller = clients.iter().any(|c| c.is_controller);
+        // Remove disconnected clients, then re-elect controller
         remove_clients(&mut clients, &to_remove);
-        if had_controller && !clients.iter().any(|c| c.is_controller) {
-            elect_controller(&mut clients);
+
+        // Re-elect controller after any changes
+        // (new clients reaching Live, clients removed, etc.)
+        let old_controller_id = clients
+            .iter()
+            .position(|c| c.is_controller);
+        let mut new_controller_id = None;
+        for (i, c) in clients.iter().enumerate().rev() {
+            if c.state == ClientState::Live
+                && !c.flags.contains(ClientFlags::READONLY)
+                && !c.flags.contains(ClientFlags::LOW_PRIORITY)
+            {
+                new_controller_id = Some(i);
+                break;
+            }
+        }
+        // If controller changed, update flags and send ResizeReq
+        if new_controller_id != old_controller_id {
+            for c in clients.iter_mut() {
+                c.is_controller = false;
+            }
+            if let Some(idx) = new_controller_id {
+                clients[idx].is_controller = true;
+                let pkt = Packet::empty(MsgType::ResizeReq);
+                clients[idx].queue_packet(&pkt);
+            }
         }
 
         // Server exit condition: child exited, no clients, at least one was notified
@@ -673,7 +696,7 @@ fn handle_client_input(
                         if !client.flags.contains(ClientFlags::READONLY)
                             && !client.flags.contains(ClientFlags::LOW_PRIORITY)
                         {
-                            client.is_controller = true;
+                            // Controller will be elected in the main loop
                         }
                     } else {
                         client.replay_buf = Some(snapshot);
@@ -759,7 +782,7 @@ fn continue_replay(
             if !client.flags.contains(ClientFlags::READONLY)
                 && !client.flags.contains(ClientFlags::LOW_PRIORITY)
             {
-                client.is_controller = true;
+                // Controller will be elected in the main loop
             }
 
             return true;
@@ -820,6 +843,11 @@ fn handle_child_exit(
 // ---------------------------------------------------------------------------
 
 fn elect_controller(clients: &mut [ServerClient]) {
+    // Clear all controller flags first
+    for c in clients.iter_mut() {
+        c.is_controller = false;
+    }
+    // Elect the most recently added, eligible, live client
     for c in clients.iter_mut().rev() {
         if c.state == ClientState::Live
             && !c.flags.contains(ClientFlags::READONLY)
