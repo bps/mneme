@@ -244,11 +244,13 @@ pub fn run_server(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Bind + listen BEFORE spawning child — fail early
-    let listener = bind_listen(&opts.socket_path)?;
+    let listener = bind_listen(&opts.socket_path)
+        .map_err(|e| format!("bind {}: {e}", opts.socket_path.display()))?;
     listener.set_nonblocking(true)?;
 
     // Open PTY
-    let (leader_fd, follower_fd) = open_pty()?;
+    let (leader_fd, follower_fd) = open_pty()
+        .map_err(|e| format!("openpty: {e}"))?;
 
     // Set initial terminal size on the PTY
     let winsize = libc::winsize {
@@ -262,7 +264,8 @@ pub fn run_server(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Spawn child
-    let child = spawn_child(&opts.command, follower_fd)?;
+    let child = spawn_child(&opts.command, follower_fd)
+        .map_err(|e| format!("spawn {:?}: {e}", opts.command))?;
     let child_pid = child.id();
 
     // Signal readiness to the CLI by closing the ready fd
@@ -415,28 +418,8 @@ fn server_mainloop(
 
             // Check if child exited
             if child_running {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        child_running = false;
-                        exit_status = Some(status.code().unwrap_or(1) as u32);
-
-                        // Send Exit to all live clients
-                        let pkt = Packet::exit(exit_status.unwrap());
-                        let mut to_remove = Vec::new();
-                        for (i, c) in clients.iter_mut().enumerate() {
-                            if c.state == ClientState::Live {
-                                if !c.queue_packet(&pkt) {
-                                    to_remove.push(i);
-                                }
-                                exit_notified = true;
-                            }
-                            // For replaying clients, Exit will be sent after ReplayEnd
-                        }
-                        remove_clients(&mut clients, &to_remove);
-                    }
-                    Ok(None) => {} // still running
-                    Err(_) => {}
-                }
+                handle_child_exit(&mut child, &mut child_running, &mut exit_status,
+                                  &mut clients, &mut exit_notified);
             }
         }
 
@@ -460,20 +443,18 @@ fn server_mainloop(
                     pty_data = Some(data);
                 }
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    // PTY closed
-                    if child_running {
-                        child_running = false;
-                        match child.try_wait() {
-                            Ok(Some(status)) => {
-                                exit_status = Some(status.code().unwrap_or(1) as u32);
-                            }
-                            _ => {
-                                exit_status = Some(1);
-                            }
-                        }
-                    }
+                    // PTY closed — child exited
+                    handle_child_exit(&mut child, &mut child_running, &mut exit_status,
+                                      &mut clients, &mut exit_notified);
                 }
-                Err(_) => {} // ignore transient errors
+                Err(e) => {
+                    // EIO is common on macOS when child exits
+                    if e.raw_os_error() == Some(libc::EIO) {
+                        handle_child_exit(&mut child, &mut child_running, &mut exit_status,
+                                          &mut clients, &mut exit_notified);
+                    }
+                    // else: ignore transient errors
+                }
             }
         }
 
@@ -745,6 +726,36 @@ fn continue_replay(
     }
 
     true
+}
+
+fn handle_child_exit(
+    child: &mut std::process::Child,
+    child_running: &mut bool,
+    exit_status: &mut Option<u32>,
+    clients: &mut Vec<ServerClient>,
+    exit_notified: &mut bool,
+) {
+    if !*child_running {
+        return;
+    }
+    *child_running = false;
+    *exit_status = match child.try_wait() {
+        Ok(Some(status)) => Some(status.code().unwrap_or(1) as u32),
+        _ => Some(1),
+    };
+
+    // Send Exit to all live clients
+    let pkt = Packet::exit(exit_status.unwrap());
+    let mut to_remove = Vec::new();
+    for (i, c) in clients.iter_mut().enumerate() {
+        if c.state == ClientState::Live {
+            if !c.queue_packet(&pkt) {
+                to_remove.push(i);
+            }
+            *exit_notified = true;
+        }
+    }
+    remove_clients(clients, &to_remove);
 }
 
 // ---------------------------------------------------------------------------
