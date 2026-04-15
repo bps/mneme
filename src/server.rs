@@ -359,7 +359,7 @@ fn server_mainloop(
     listener: UnixListener,
     leader_fd: OwnedFd,
     mut child: std::process::Child,
-    _child_pid: u32,
+    child_pid: u32,
     ring_size: usize,
     _socket_path: &std::path::Path,
 ) -> io::Result<()> {
@@ -482,6 +482,7 @@ fn server_mainloop(
                 match handle_client_input(
                     client,
                     &leader_fd,
+                    child_pid,
                     &ring,
                     child_running,
                     exit_status,
@@ -546,6 +547,7 @@ fn server_mainloop(
 fn handle_client_input(
     client: &mut ServerClient,
     leader_fd: &OwnedFd,
+    child_pid: u32,
     ring: &RingBuffer,
     child_running: bool,
     exit_status: Option<u32>,
@@ -664,8 +666,10 @@ fn handle_client_input(
                             };
                             unsafe {
                                 libc::ioctl(leader_fd.as_raw_fd(), libc::TIOCSWINSZ, &ws);
+                                // Signal the child's process group to redraw.
+                                // The child called setsid() so its PGID == its PID.
+                                libc::kill(-(child_pid as libc::pid_t), libc::SIGWINCH);
                             }
-                            // TODO: send SIGWINCH to child process group
                         }
                     }
                 }

@@ -156,9 +156,6 @@ fn client_mainloop(
     };
     signal_hook::low_level::pipe::register(libc::SIGWINCH, sig_write)?;
 
-    // Send initial resize
-    send_resize(&stream)?;
-
     let mut read_buf = [0u8; 4096];
     let mut in_replay = true;
 
