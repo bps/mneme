@@ -215,6 +215,32 @@ fn get_terminal_size() -> (u16, u16) {
 
 fn create_session(opts: &CliOpts) -> Result<(), Box<dyn std::error::Error>> {
     let socket_path = socket::socket_path(&opts.session_name)?;
+
+    // Check for existing session
+    if socket_path.exists() {
+        if !opts.force {
+            // Try connecting to see if it's alive
+            match std::os::unix::net::UnixStream::connect(&socket_path) {
+                Ok(_) => {
+                    return Err(format!(
+                        "session '{}' already exists (use -f to force)",
+                        opts.session_name
+                    )
+                    .into());
+                }
+                Err(_) => {
+                    // Stale socket — still require -f to be explicit
+                    return Err(format!(
+                        "stale socket for '{}' exists (use -f to force)",
+                        opts.session_name
+                    )
+                    .into());
+                }
+            }
+        }
+        // -f: remove the existing socket
+        let _ = std::fs::remove_file(&socket_path);
+    }
     let (rows, cols) = get_terminal_size();
     let cmd = if opts.command.is_empty() {
         default_command()
