@@ -120,28 +120,32 @@ impl RawTerminal {
 
         rustix::termios::tcsetattr(&stdin, rustix::termios::OptionalActions::Now, &raw)?;
 
+        // Enter alternate screen — isolates the session from the shell.
+        // The terminal emulator saves the current screen and cursor state;
+        // on exit we restore it, giving a clean return to the prompt.
+        let stdout = io::stdout();
+        let _ = protocol::write_all_fd(
+            stdout.as_fd(),
+            b"\x1b[?1049h\x1b[H",
+        );
+
         Ok(Self { orig })
     }
 }
 
 impl Drop for RawTerminal {
     fn drop(&mut self) {
-        let stdin = io::stdin();
-        let _ = rustix::termios::tcsetattr(
-            &stdin,
-            rustix::termios::OptionalActions::Flush,
-            &self.orig,
-        );
-        // Reset terminal modes that TUI apps may have enabled via escape
-        // sequences (these aren't covered by termios restore).
+        // Exit alternate screen — terminal emulator restores the saved
+        // screen, cursor position, and cursor visibility automatically.
+        // Also explicitly reset modes that live outside the alt screen:
         let stdout = io::stdout();
         let _ = protocol::write_all_fd(
             stdout.as_fd(),
             concat!(
-                "\x1b[?25h",    // show cursor (DECTCEM)
-                "\x1b[0m",      // reset text attributes (SGR)
+                "\x1b[?25h",    // show cursor
+                "\x1b[0m",      // reset text attributes
                 "\x1b[<u",      // pop kitty keyboard protocol
-                "\x1b[?1049l",  // exit alternate screen
+                "\x1b[?1049l",  // exit alternate screen (restores saved state)
                 "\x1b[?2004l",  // disable bracketed paste
                 "\x1b[?1000l",  // disable mouse (X11 basic)
                 "\x1b[?1002l",  // disable mouse (button-event)
@@ -149,6 +153,13 @@ impl Drop for RawTerminal {
                 "\x1b[?1006l",  // disable mouse (SGR encoding)
             )
             .as_bytes(),
+        );
+
+        let stdin = io::stdin();
+        let _ = rustix::termios::tcsetattr(
+            &stdin,
+            rustix::termios::OptionalActions::Flush,
+            &self.orig,
         );
     }
 }
