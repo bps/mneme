@@ -2,27 +2,36 @@ use std::io;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
-use rustix::fs::{self, AtFlags, Mode, OFlags, CWD};
+use rustix::fs::{self, AtFlags, CWD, Mode, OFlags};
 
 /// Validate a session name: [a-zA-Z0-9._-], max 64 bytes.
-pub fn validate_session_name(name: &str) -> Result<(), String> {
+pub fn validate_session_name(name: &str) -> Result<(), io::Error> {
     if name.is_empty() {
-        return Err("session name cannot be empty".into());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session name cannot be empty",
+        ));
     }
     if name.len() > 64 {
-        return Err("session name too long (max 64 characters)".into());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session name too long (max 64 characters)",
+        ));
     }
     if !name
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
     {
-        return Err(
-            "session name must contain only alphanumeric characters, dots, underscores, or hyphens"
-                .into(),
-        );
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session name must contain only alphanumeric characters, dots, underscores, or hyphens",
+        ));
     }
     if name.starts_with('.') || name.starts_with('-') {
-        return Err("session name must not start with '.' or '-'".into());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session name must not start with '.' or '-'",
+        ));
     }
     Ok(())
 }
@@ -60,7 +69,7 @@ pub fn socket_dir() -> Result<PathBuf, io::Error> {
                 .filter(|s| !s.is_empty())
                 .map(|d| PathBuf::from(d).join("mneme"))
                 .unwrap_or_default(),
-            true,  // TMPDIR on macOS is already per-user (/var/folders/.../T/)
+            true, // TMPDIR on macOS is already per-user (/var/folders/.../T/)
             false,
         ),
         // Last resort: shared /tmp with per-uid subdirectory
@@ -112,6 +121,85 @@ pub fn socket_path(name: &str) -> Result<PathBuf, io::Error> {
     Ok(dir.join(name))
 }
 
+/// Build the lock-file path for a session name.
+/// The lock file sits next to the socket and is flocked by the server for
+/// the duration of its lifetime. A session is considered stale iff the
+/// lock is not held by any process.
+pub fn lock_path(name: &str) -> Result<PathBuf, io::Error> {
+    let dir = socket_dir()?;
+    Ok(dir.join(format!("{name}.lock")))
+}
+
+// ---------------------------------------------------------------------------
+// Lock-file operations
+//
+// The server holds an exclusive flock on `<name>.lock` for its entire
+// lifetime. The kernel releases the lock when the process dies (clean
+// exit, SIGKILL, crash, OOM, power loss), so stale detection is reliable
+// without any timeouts or heuristics.
+//
+// We use flock(2) (BSD-style, whole-file, per-open-file-description).
+// It works on macOS and Linux, is cheap, and is released on process
+// death. Unlike fcntl locks, flock state doesn't leak across dup()/fork()
+// weirdness in the same way.
+// ---------------------------------------------------------------------------
+
+/// Try to acquire an exclusive, non-blocking flock on the given path.
+/// Creates the file if it does not exist (mode 0600).
+///
+/// - Ok(Some(fd)) -> lock acquired; caller owns it for as long as they
+///   hold the fd. Dropping the fd releases the lock.
+/// - Ok(None) -> another process holds the lock (session is live).
+/// - Err(e) -> I/O error (permissions, etc).
+pub fn try_acquire_lock(path: &Path) -> io::Result<Option<OwnedFd>> {
+    let fd = fs::open(
+        path,
+        OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )?;
+
+    // flock is the BSD-style whole-file advisory lock. EX + NB.
+    let ret = unsafe {
+        libc::flock(
+            rustix::fd::AsRawFd::as_raw_fd(&fd),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+    };
+    if ret == 0 {
+        Ok(Some(fd))
+    } else {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            Ok(None)
+        } else {
+            Err(err)
+        }
+    }
+}
+
+/// Check whether a session is stale (no server holding the lock).
+/// Returns true if the session's lock file is absent OR unlockable.
+/// If the lock could be acquired, it is immediately released.
+pub fn is_session_stale(lock_path: &Path) -> bool {
+    // If the lock file doesn't exist, treat as stale (no server to hold it).
+    if !lock_path.exists() {
+        return true;
+    }
+    match try_acquire_lock(lock_path) {
+        Ok(Some(_fd)) => true, // acquired -> no live server; dropped here
+        Ok(None) => false,     // held by someone -> live
+        Err(_) => false,       // unknown -> conservative: treat as live
+    }
+}
+
+/// Clean up a stale session's on-disk state: socket + lock file.
+/// Safe to call when `is_session_stale` returned true, because no live
+/// process can be using either file.
+pub fn cleanup_stale_session(socket_path: &Path, lock_path: &Path) {
+    let _ = std::fs::remove_file(socket_path);
+    let _ = std::fs::remove_file(lock_path);
+}
+
 // ---------------------------------------------------------------------------
 // Safe directory operations using openat/fstat (no TOCTOU)
 // ---------------------------------------------------------------------------
@@ -126,7 +214,7 @@ fn ensure_dir_exists(path: &Path) -> io::Result<()> {
             if path.is_dir() {
                 Ok(())
             } else {
-                Err(io::Error::new(io::ErrorKind::Other, "not a directory"))
+                Err(io::Error::other("not a directory"))
             }
         }
         Err(e) => Err(e),
@@ -136,7 +224,7 @@ fn ensure_dir_exists(path: &Path) -> io::Result<()> {
 /// Ensure a directory exists, is owned by `expected_uid`, and has the
 /// given mode. For the leaf directory: uses open(O_DIRECTORY|O_NOFOLLOW)
 /// + fstat on the opened fd. Parent path components are allowed to be
-/// symlinks (e.g. /var → /private/var on macOS).
+///   symlinks (e.g. /var → /private/var on macOS).
 fn ensure_safe_dir(path: &Path, expected_uid: u32, mode: Mode) -> io::Result<()> {
     // Resolve symlinks in parent components, keep the leaf unresolved
     let canonical = match path.parent() {
@@ -187,7 +275,7 @@ fn ensure_shared_base(path: &Path) -> io::Result<()> {
     let stat = fs::statat(CWD, &canonical, AtFlags::SYMLINK_NOFOLLOW)?;
     let file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
     if file_type != rustix::fs::FileType::Directory {
-        return Err(io::Error::new(io::ErrorKind::Other, "not a directory"));
+        return Err(io::Error::other("not a directory"));
     }
 
     Ok(())
@@ -212,7 +300,7 @@ fn verify_dir_fd(fd: &OwnedFd, expected_uid: u32) -> io::Result<()> {
     // Must be a directory
     let file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
     if file_type != rustix::fs::FileType::Directory {
-        return Err(io::Error::new(io::ErrorKind::Other, "not a directory"));
+        return Err(io::Error::other("not a directory"));
     }
 
     // Must be owned by us
@@ -234,7 +322,6 @@ fn verify_dir_fd(fd: &OwnedFd, expected_uid: u32) -> io::Result<()> {
 
     Ok(())
 }
-
 
 // ---------------------------------------------------------------------------
 // Tests

@@ -6,8 +6,60 @@ mod socket;
 
 use clap::{Parser, Subcommand};
 use std::env;
-use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd};
 use std::process;
+
+// ---------------------------------------------------------------------------
+// Error type
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+enum Error {
+    Io(std::io::Error),
+    Message(String),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Io(e) => write!(f, "{e}"),
+            Error::Message(msg) => write!(f, "{msg}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io(e) => Some(e),
+            Error::Message(_) => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error::Io(e)
+    }
+}
+
+impl From<String> for Error {
+    fn from(msg: String) -> Self {
+        Error::Message(msg)
+    }
+}
+
+impl From<&str> for Error {
+    fn from(msg: &str) -> Self {
+        Error::Message(msg.to_owned())
+    }
+}
+
+impl From<rustix::io::Errno> for Error {
+    fn from(e: rustix::io::Errno) -> Self {
+        Error::Io(e.into())
+    }
+}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -88,16 +140,14 @@ fn parse_detach_key(s: &str) -> Result<u8, String> {
 
 fn parse_size(s: &str) -> Result<usize, String> {
     let s = s.trim();
-    let (num_str, multiplier) = if s.ends_with('M') || s.ends_with('m') {
-        (&s[..s.len() - 1], 1024 * 1024)
-    } else if s.ends_with('K') || s.ends_with('k') {
-        (&s[..s.len() - 1], 1024)
+    let (num_str, multiplier) = if let Some(n) = s.strip_suffix(['M', 'm']) {
+        (n, 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix(['K', 'k']) {
+        (n, 1024)
     } else {
         (s, 1)
     };
-    let n: usize = num_str
-        .parse()
-        .map_err(|_| format!("invalid size: {s}"))?;
+    let n: usize = num_str.parse().map_err(|_| format!("invalid size: {s}"))?;
     Ok(n * multiplier)
 }
 
@@ -219,7 +269,7 @@ struct AutoOpts {
 // Dispatch
 // ---------------------------------------------------------------------------
 
-fn run_cli(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
+fn run_cli(cli: Cli) -> Result<i32, Error> {
     match cli.command {
         None | Some(Cmd::List) => {
             list_sessions()?;
@@ -227,25 +277,61 @@ fn run_cli(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
         }
         Some(Cmd::Create(opts)) => {
             socket::validate_session_name(&opts.name)?;
-            do_create(&opts.name, &opts.command, opts.ring_size, opts.force, opts.quiet)?;
+            do_create(
+                &opts.name,
+                &opts.command,
+                opts.ring_size,
+                opts.force,
+                opts.quiet,
+            )?;
             do_attach(&opts.name, opts.detach_key, false, false, opts.quiet)
         }
         Some(Cmd::New(opts)) => {
             socket::validate_session_name(&opts.name)?;
-            do_create(&opts.name, &opts.command, opts.ring_size, opts.force, opts.quiet)?;
+            do_create(
+                &opts.name,
+                &opts.command,
+                opts.ring_size,
+                opts.force,
+                opts.quiet,
+            )?;
             Ok(0)
         }
         Some(Cmd::Attach(opts)) => {
             socket::validate_session_name(&opts.name)?;
-            do_attach(&opts.name, opts.detach_key, opts.readonly, opts.low_priority, opts.quiet)
+            do_attach(
+                &opts.name,
+                opts.detach_key,
+                opts.readonly,
+                opts.low_priority,
+                opts.quiet,
+            )
         }
         Some(Cmd::Auto(opts)) => {
             socket::validate_session_name(&opts.name)?;
             if session_exists(&opts.name)? {
-                do_attach(&opts.name, opts.detach_key, opts.readonly, opts.low_priority, opts.quiet)
+                do_attach(
+                    &opts.name,
+                    opts.detach_key,
+                    opts.readonly,
+                    opts.low_priority,
+                    opts.quiet,
+                )
             } else {
-                do_create(&opts.name, &opts.command, opts.ring_size, opts.force, opts.quiet)?;
-                do_attach(&opts.name, opts.detach_key, opts.readonly, opts.low_priority, opts.quiet)
+                do_create(
+                    &opts.name,
+                    &opts.command,
+                    opts.ring_size,
+                    opts.force,
+                    opts.quiet,
+                )?;
+                do_attach(
+                    &opts.name,
+                    opts.detach_key,
+                    opts.readonly,
+                    opts.low_priority,
+                    opts.quiet,
+                )
             }
         }
         Some(Cmd::Kill(opts)) => {
@@ -287,25 +373,22 @@ fn do_create(
     ring_size: usize,
     force: bool,
     quiet: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Error> {
     let socket_path = socket::socket_path(name)?;
+    let lock_path = socket::lock_path(name)?;
 
-    if socket_path.exists() {
-        if !force {
-            match std::os::unix::net::UnixStream::connect(&socket_path) {
-                Ok(_) => {
-                    return Err(format!(
-                        "session '{name}' already exists (use -f to force)"
-                    ).into());
-                }
-                Err(_) => {
-                    return Err(format!(
-                        "stale socket for '{name}' exists (use -f to force)"
-                    ).into());
-                }
-            }
+    // Liveness check: a session is alive iff a process holds its lock.
+    // The kernel releases flock on any form of process death, so this
+    // correctly identifies crashed servers without racy sleeps or
+    // PID-reuse hazards.
+    if socket_path.exists() || lock_path.exists() {
+        let stale = socket::is_session_stale(&lock_path);
+        if !stale && !force {
+            return Err(format!("session '{name}' already exists (use -f to force)").into());
         }
-        let _ = std::fs::remove_file(&socket_path);
+        // Either stale (safe to clean) or forced. In either case, clean
+        // up both files before the server tries to bind.
+        socket::cleanup_stale_session(&socket_path, &lock_path);
     }
 
     let (rows, cols) = get_terminal_size();
@@ -315,18 +398,11 @@ fn do_create(
         command.to_vec()
     };
 
-    let (cli_fd, server_raw_fd) = {
-        let mut fds = [0i32; 2];
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        unsafe {
-            libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
-        }
-        (unsafe { OwnedFd::from_raw_fd(fds[0]) }, fds[1])
-    };
+    let (cli_fd, server_fd) = rustix::pipe::pipe()?;
+    rustix::io::fcntl_setfd(&cli_fd, rustix::io::FdFlags::CLOEXEC)?;
 
     let exe = env::current_exe()?;
+    let server_raw_fd = server_fd.as_raw_fd();
     let mut server_args: Vec<String> = vec![
         "--server".into(),
         name.into(),
@@ -339,7 +415,7 @@ fn do_create(
         "--ring-size".into(),
         format!("{ring_size}"),
         "--socket-path".into(),
-        socket_path.to_string_lossy().to_string(),
+        socket_path.to_string_lossy().into_owned(),
         "--".into(),
     ];
     server_args.extend(cmd);
@@ -357,9 +433,7 @@ fn do_create(
 
     let _child = command.spawn()?;
 
-    unsafe {
-        libc::close(server_raw_fd);
-    }
+    drop(server_fd);
 
     let mut error_buf = vec![0u8; 4096];
     let n = rustix::io::read(&cli_fd, &mut error_buf)?;
@@ -380,7 +454,7 @@ fn do_attach(
     readonly: bool,
     low_priority: bool,
     quiet: bool,
-) -> Result<i32, Box<dyn std::error::Error>> {
+) -> Result<i32, Error> {
     let socket_path = socket::socket_path(name)?;
     let flags = {
         let mut f = protocol::ClientFlags::empty();
@@ -418,50 +492,69 @@ fn do_attach(
     }
 }
 
-fn session_exists(name: &str) -> Result<bool, Box<dyn std::error::Error>> {
+fn session_exists(name: &str) -> Result<bool, Error> {
     let path = socket::socket_path(name)?;
-    if !path.exists() {
+    let lock_path = socket::lock_path(name)?;
+    if !path.exists() && !lock_path.exists() {
         return Ok(false);
     }
-    match std::os::unix::net::UnixStream::connect(&path) {
-        Ok(_) => Ok(true),
-        Err(_) => {
-            let _ = std::fs::remove_file(&path);
-            Ok(false)
-        }
+    if socket::is_session_stale(&lock_path) {
+        socket::cleanup_stale_session(&path, &lock_path);
+        return Ok(false);
     }
+    Ok(true)
 }
 
-fn do_kill(name: &str, quiet: bool) -> Result<i32, Box<dyn std::error::Error>> {
+fn do_kill(name: &str, quiet: bool) -> Result<i32, Error> {
     let path = socket::socket_path(name)?;
+    let lock_path = socket::lock_path(name)?;
     let welcome = match query_session(&path) {
         Ok(w) => w,
         Err(_) => {
-            // Socket exists but server isn't responding — clean up stale socket
-            if path.exists() {
-                let _ = std::fs::remove_file(&path);
-                if !quiet {
-                    eprintln!("mn: {name}: removed stale socket");
+            // Socket/lock exists but server isn't responding. If the lock
+            // can be acquired, the server is truly dead — clean up.
+            if path.exists() || lock_path.exists() {
+                if socket::is_session_stale(&lock_path) {
+                    socket::cleanup_stale_session(&path, &lock_path);
+                    if !quiet {
+                        eprintln!("mn: {name}: removed stale session");
+                    }
+                    return Ok(0);
                 }
-                return Ok(0);
+                return Err(format!("session '{name}' not responding but lock still held").into());
             }
             return Err(format!("session '{name}' not found").into());
         }
     };
 
     // Kill the server process
-    let pid = welcome.server_pid as libc::pid_t;
-    let ret = unsafe { libc::kill(pid, libc::SIGTERM) };
-    if ret != 0 {
-        return Err(format!("failed to kill server (pid {pid}): {}",
-            std::io::Error::last_os_error()).into());
+    let pid = rustix::process::Pid::from_raw(welcome.server_pid as i32)
+        .ok_or_else(|| Error::from(format!("invalid server pid: {}", welcome.server_pid)))?;
+    rustix::process::kill_process(pid, rustix::process::Signal::TERM).map_err(|e| {
+        Error::from(format!(
+            "failed to kill server (pid {}): {e}",
+            welcome.server_pid
+        ))
+    })?;
+
+    // Wait for the server to actually die by polling the lock. The kernel
+    // releases flock on process death, so once we can acquire the lock,
+    // the server is gone. Bounded to ~2s as a safety net.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if socket::is_session_stale(&lock_path) {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(
+                format!("server (pid {}) did not exit within 2s", welcome.server_pid).into(),
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
     }
 
-    // Wait briefly for cleanup
-    std::thread::sleep(std::time::Duration::from_millis(200));
-
-    // Remove socket if still present
-    let _ = std::fs::remove_file(&path);
+    // Remove any leftover files (the server normally cleans these up itself).
+    socket::cleanup_stale_session(&path, &lock_path);
 
     if !quiet {
         eprintln!("mn: {name}: killed");
@@ -469,7 +562,7 @@ fn do_kill(name: &str, quiet: bool) -> Result<i32, Box<dyn std::error::Error>> {
     Ok(0)
 }
 
-fn do_kill_all(quiet: bool) -> Result<i32, Box<dyn std::error::Error>> {
+fn do_kill_all(quiet: bool) -> Result<i32, Error> {
     let dir = socket::socket_dir()?;
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
@@ -489,7 +582,7 @@ fn do_kill_all(quiet: bool) -> Result<i32, Box<dyn std::error::Error>> {
             continue;
         }
 
-        let name = entry.file_name().to_string_lossy().to_string();
+        let name = entry.file_name().to_string_lossy().into_owned();
         match do_kill(&name, quiet) {
             Ok(_) => count += 1,
             Err(e) => {
@@ -500,13 +593,29 @@ fn do_kill_all(quiet: bool) -> Result<i32, Box<dyn std::error::Error>> {
         }
     }
 
+    // Sweep orphan lock files (no paired socket) whose owning server is
+    // gone. This covers servers that died after unlinking the socket but
+    // before unlinking the lock.
+    if let Ok(entries2) = std::fs::read_dir(&dir) {
+        for entry in entries2.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".lock") {
+                continue;
+            }
+            let lock_path = entry.path();
+            if socket::is_session_stale(&lock_path) {
+                let _ = std::fs::remove_file(&lock_path);
+            }
+        }
+    }
+
     if !quiet && count == 0 {
         eprintln!("mn: no sessions to kill");
     }
     Ok(0)
 }
 
-fn list_sessions() -> Result<(), Box<dyn std::error::Error>> {
+fn list_sessions() -> Result<(), Error> {
     let dir = socket::socket_dir()?;
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
@@ -529,15 +638,24 @@ fn list_sessions() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        let name = entry.file_name().to_string_lossy().to_string();
+        let name = entry.file_name().to_string_lossy().into_owned();
 
-        let welcome = match query_session(&path) {
-            Ok(w) => Some(w),
-            Err(_) => {
-                let _ = std::fs::remove_file(&path);
-                None
-            }
-        };
+        // Skip lock files; they're paired with the real socket entries.
+        if name.ends_with(".lock") {
+            continue;
+        }
+
+        let lock_path = socket::lock_path(&name)?;
+        if socket::is_session_stale(&lock_path) {
+            // Server is dead — clean up both files and skip.
+            socket::cleanup_stale_session(&path, &lock_path);
+            continue;
+        }
+
+        // Lock is held but query may fail (e.g. server is in
+        // startup or shutdown). Skip rather than unlink —
+        // unlinking a live session's socket would be harmful.
+        let welcome = query_session(&path).ok();
 
         if let Some(ref w) = welcome {
             sessions.push((name, Some(w.clone())));
@@ -548,7 +666,7 @@ fn list_sessions() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    sessions.sort_by(|a, b| a.0.cmp(&b.0));
+    sessions.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     println!("Active sessions");
     for (name, welcome) in &sessions {
         if let Some(w) = welcome {
@@ -559,20 +677,14 @@ fn list_sessions() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 ' '
             };
-            println!(
-                "{status} {pid:>6}  {name}",
-                pid = w.server_pid,
-                name = name,
-            );
+            println!("{status} {pid:>6}  {name}", pid = w.server_pid, name = name,);
         }
     }
 
     Ok(())
 }
 
-fn query_session(
-    path: &std::path::Path,
-) -> Result<protocol::Welcome, Box<dyn std::error::Error>> {
+fn query_session(path: &std::path::Path) -> Result<protocol::Welcome, Error> {
     use std::os::unix::net::UnixStream;
 
     let stream = UnixStream::connect(path)?;

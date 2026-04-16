@@ -1,4 +1,4 @@
-use crate::protocol::{self, ClientFlags, Intent, MsgType, Packet, PROTOCOL_VERSION};
+use crate::protocol::{self, ClientFlags, Intent, MsgType, PROTOCOL_VERSION, Packet};
 
 use rustix::event::{PollFd, PollFlags};
 use std::io;
@@ -27,7 +27,7 @@ pub fn attach(
     cols: u16,
     detach_key: u8,
     _quiet: bool,
-) -> Result<AttachResult, Box<dyn std::error::Error>> {
+) -> Result<AttachResult, crate::Error> {
     let stream = UnixStream::connect(socket_path)?;
     stream.set_nonblocking(false)?; // blocking for handshake
 
@@ -45,9 +45,7 @@ pub fn attach(
     let pkt = protocol::recv_packet(stream.as_fd())?;
     match pkt.msg_type {
         MsgType::Welcome => {
-            let welcome = pkt
-                .parse_welcome()
-                .ok_or("malformed welcome packet")?;
+            let welcome = pkt.parse_welcome().ok_or("malformed welcome packet")?;
             if welcome.version != PROTOCOL_VERSION {
                 return Err(format!(
                     "protocol version mismatch: client={}, server={}",
@@ -124,10 +122,7 @@ impl RawTerminal {
         // The terminal emulator saves the current screen and cursor state;
         // on exit we restore it, giving a clean return to the prompt.
         let stdout = io::stdout();
-        let _ = protocol::write_all_fd(
-            stdout.as_fd(),
-            b"\x1b[?1049h\x1b[H",
-        );
+        let _ = protocol::write_all_fd(stdout.as_fd(), b"\x1b[?1049h\x1b[H");
 
         Ok(Self { orig })
     }
@@ -140,17 +135,11 @@ impl Drop for RawTerminal {
         // Then exit alternate screen — the terminal emulator restores
         // the saved screen, cursor, attributes, and all DEC private modes.
         let stdout = io::stdout();
-        let _ = protocol::write_all_fd(
-            stdout.as_fd(),
-            b"\x1b[<u\x1b[?1049l",
-        );
+        let _ = protocol::write_all_fd(stdout.as_fd(), b"\x1b[<u\x1b[?1049l");
 
         let stdin = io::stdin();
-        let _ = rustix::termios::tcsetattr(
-            &stdin,
-            rustix::termios::OptionalActions::Flush,
-            &self.orig,
-        );
+        let _ =
+            rustix::termios::tcsetattr(&stdin, rustix::termios::OptionalActions::Flush, &self.orig);
     }
 }
 
@@ -168,18 +157,18 @@ fn client_mainloop(
     stream: UnixStream,
     detach_key: u8,
     flags: ClientFlags,
-) -> Result<AttachResult, Box<dyn std::error::Error>> {
+) -> Result<AttachResult, crate::Error> {
     let stdin = io::stdin();
     let stdout = io::stdout();
 
     // Debug: log stdin bytes to a file if MNEME_DEBUG is set
-    let debug_file = std::env::var("MNEME_DEBUG").ok().map(|path| {
+    let debug_file = std::env::var("MNEME_DEBUG").ok().and_then(|path| {
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
             .ok()
-    }).flatten();
+    });
 
     // Set up SIGWINCH self-pipe
     let (sig_read, sig_write) = {
@@ -188,7 +177,7 @@ fn client_mainloop(
         set_fd_nonblocking(&w)?;
         (r, w)
     };
-    signal_hook::low_level::pipe::register(libc::SIGWINCH, sig_write)?;
+    signal_hook::low_level::pipe::register(signal_hook::consts::SIGWINCH, sig_write)?;
 
     // Build the CSI u (kitty keyboard protocol) encoding of the detach key.
     // When a TUI app enables this protocol, Ctrl-\ arrives as ESC[92;5u
@@ -238,7 +227,7 @@ fn client_mainloop(
                 // Debug log
                 if let Some(ref mut f) = debug_file.as_ref() {
                     use std::io::Write;
-                    let _ = write!(f, "stdin[{}]: {:02x?}\n", n, &read_buf[..n]);
+                    let _ = writeln!(f, "stdin[{}]: {:02x?}", n, &read_buf[..n]);
                 }
 
                 // Check for detach key: raw byte or CSI u encoded
@@ -265,7 +254,10 @@ fn client_mainloop(
         }
 
         // Data from server
-        if pollfds[1].revents().intersects(PollFlags::IN | PollFlags::HUP) {
+        if pollfds[1]
+            .revents()
+            .intersects(PollFlags::IN | PollFlags::HUP)
+        {
             let n = match protocol::try_read(stream.as_fd(), &mut read_buf) {
                 Ok(0) => continue, // would block
                 Ok(n) => n,
@@ -306,7 +298,9 @@ fn client_mainloop(
         }
 
         // Server disconnected
-        if pollfds[1].revents().contains(PollFlags::HUP) && !pollfds[1].revents().contains(PollFlags::IN) {
+        if pollfds[1].revents().contains(PollFlags::HUP)
+            && !pollfds[1].revents().contains(PollFlags::IN)
+        {
             return Ok(AttachResult::IoError);
         }
     }
@@ -319,8 +313,7 @@ fn client_mainloop(
 fn send_resize(stream: &UnixStream) -> io::Result<()> {
     let (rows, cols) = crate::get_terminal_size();
     let pkt = Packet::resize(rows, cols);
-    protocol::send_packet(stream.as_fd(), &pkt)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    protocol::send_packet(stream.as_fd(), &pkt).map_err(io::Error::other)
 }
 
 /// Try to parse a complete packet from the front of a byte buffer.
@@ -361,10 +354,10 @@ fn csi_u_press_sequence(detach_key: u8) -> Vec<u8> {
 /// Returns Some((position, length)) or None.
 fn find_detach_key(buf: &[u8], raw_key: u8, csi_u: &[u8]) -> Option<(usize, usize)> {
     // Check CSI u first (longer match takes priority to avoid partial matches)
-    if !csi_u.is_empty() {
-        if let Some(pos) = buf.windows(csi_u.len()).position(|w| w == csi_u) {
-            return Some((pos, csi_u.len()));
-        }
+    if !csi_u.is_empty()
+        && let Some(pos) = buf.windows(csi_u.len()).position(|w| w == csi_u)
+    {
+        return Some((pos, csi_u.len()));
     }
     // Check raw byte
     if let Some(pos) = buf.iter().position(|&b| b == raw_key) {

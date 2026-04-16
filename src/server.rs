@@ -1,4 +1,4 @@
-use crate::protocol::{self, ClientFlags, Intent, MsgType, Packet, PROTOCOL_VERSION};
+use crate::protocol::{self, ClientFlags, Intent, MsgType, PROTOCOL_VERSION, Packet};
 use crate::ring::RingBuffer;
 
 use rustix::event::{PollFd, PollFlags};
@@ -98,9 +98,9 @@ fn verify_peer_uid(_fd: &OwnedFd) -> io::Result<()> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClientState {
-    Connected,  // Hello not yet received
-    Replaying,  // Sending replay data
-    Live,       // Bidirectional
+    Connected, // Hello not yet received
+    Replaying, // Sending replay data
+    Live,      // Bidirectional
 }
 
 struct ServerClient {
@@ -108,8 +108,8 @@ struct ServerClient {
     state: ClientState,
     flags: ClientFlags,
     outbound: VecDeque<u8>,
-    replay_buf: Option<Vec<u8>>,  // snapshot being sent
-    replay_pos: usize,            // position in replay_buf
+    replay_buf: Option<Vec<u8>>, // snapshot being sent
+    replay_pos: usize,           // position in replay_buf
     is_controller: bool,
 }
 
@@ -176,7 +176,11 @@ struct ServerOpts {
     command: Vec<String>,
 }
 
-fn parse_server_args(args: &[String]) -> Result<ServerOpts, String> {
+fn arg_err(msg: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, msg.into())
+}
+
+fn parse_server_args(args: &[String]) -> io::Result<ServerOpts> {
     let mut ready_fd = None;
     let mut rows = 24u16;
     let mut cols = 80u16;
@@ -185,7 +189,7 @@ fn parse_server_args(args: &[String]) -> Result<ServerOpts, String> {
     let mut command = Vec::new();
 
     if args.is_empty() {
-        return Err("--server requires a session name".into());
+        return Err(arg_err("--server requires a session name"));
     }
     let _session_name = args[0].clone();
     let mut i = 1;
@@ -205,54 +209,55 @@ fn parse_server_args(args: &[String]) -> Result<ServerOpts, String> {
                 i += 1;
                 ready_fd = Some(
                     args.get(i)
-                        .ok_or("--ready-fd requires a value")?
+                        .ok_or_else(|| arg_err("--ready-fd requires a value"))?
                         .parse::<i32>()
-                        .map_err(|e| format!("invalid --ready-fd: {e}"))?,
+                        .map_err(|e| arg_err(format!("invalid --ready-fd: {e}")))?,
                 );
             }
             "--rows" => {
                 i += 1;
                 rows = args
                     .get(i)
-                    .ok_or("--rows requires a value")?
+                    .ok_or_else(|| arg_err("--rows requires a value"))?
                     .parse()
-                    .map_err(|e| format!("invalid --rows: {e}"))?;
+                    .map_err(|e| arg_err(format!("invalid --rows: {e}")))?;
             }
             "--cols" => {
                 i += 1;
                 cols = args
                     .get(i)
-                    .ok_or("--cols requires a value")?
+                    .ok_or_else(|| arg_err("--cols requires a value"))?
                     .parse()
-                    .map_err(|e| format!("invalid --cols: {e}"))?;
+                    .map_err(|e| arg_err(format!("invalid --cols: {e}")))?;
             }
             "--ring-size" => {
                 i += 1;
                 ring_size = args
                     .get(i)
-                    .ok_or("--ring-size requires a value")?
+                    .ok_or_else(|| arg_err("--ring-size requires a value"))?
                     .parse()
-                    .map_err(|e| format!("invalid --ring-size: {e}"))?;
+                    .map_err(|e| arg_err(format!("invalid --ring-size: {e}")))?;
             }
             "--socket-path" => {
                 i += 1;
                 socket_path = Some(PathBuf::from(
-                    args.get(i).ok_or("--socket-path requires a value")?,
+                    args.get(i)
+                        .ok_or_else(|| arg_err("--socket-path requires a value"))?,
                 ));
             }
             other => {
-                return Err(format!("unknown server option: {other}"));
+                return Err(arg_err(format!("unknown server option: {other}")));
             }
         }
         i += 1;
     }
 
     Ok(ServerOpts {
-        ready_fd: ready_fd.ok_or("--ready-fd is required")?,
+        ready_fd: ready_fd.ok_or_else(|| arg_err("--ready-fd is required"))?,
         rows,
         cols,
         ring_size,
-        socket_path: socket_path.ok_or("--socket-path is required")?,
+        socket_path: socket_path.ok_or_else(|| arg_err("--socket-path is required"))?,
         command,
     })
 }
@@ -261,14 +266,12 @@ fn parse_server_args(args: &[String]) -> Result<ServerOpts, String> {
 // Server entry point
 // ---------------------------------------------------------------------------
 
-pub fn run_server(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let opts = parse_server_args(args).map_err(|e| e.to_string())?;
+pub fn run_server(args: &[String]) -> Result<(), crate::Error> {
+    let opts = parse_server_args(args)?;
 
     // Take ownership of the ready fd and set CLOEXEC so the child doesn't inherit it
     let ready_fd = unsafe { OwnedFd::from_raw_fd(opts.ready_fd) };
-    unsafe {
-        libc::fcntl(opts.ready_fd, libc::F_SETFD, libc::FD_CLOEXEC);
-    }
+    rustix::io::fcntl_setfd(&ready_fd, rustix::io::FdFlags::CLOEXEC)?;
 
     // Fully detach from the calling session.
     // Note: setsid() may fail if we're already a process group leader
@@ -281,25 +284,45 @@ pub fn run_server(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
     }
 
+    // Acquire the session lock BEFORE binding. The lock file lives next
+    // to the socket and is flocked for this process's lifetime. The
+    // kernel releases it on any form of process death, which is how we
+    // detect stale sessions. We hold `_lock_fd` in scope until the end
+    // of the function.
+    let lock_path = opts.socket_path.with_file_name(format!(
+        "{}.lock",
+        opts.socket_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| format!("invalid socket path: {}", opts.socket_path.display()))?
+    ));
+    let _lock_fd = match crate::socket::try_acquire_lock(&lock_path)? {
+        Some(fd) => fd,
+        None => {
+            return Err(format!(
+                "another server already holds the session lock: {}",
+                lock_path.display()
+            )
+            .into());
+        }
+    };
+
     // Bind + listen BEFORE spawning child — fail early
     let listener = bind_listen(&opts.socket_path)
         .map_err(|e| format!("bind {}: {e}", opts.socket_path.display()))?;
     listener.set_nonblocking(true)?;
 
     // Open PTY
-    let (leader_fd, follower_fd) = open_pty()
-        .map_err(|e| format!("openpty: {e}"))?;
+    let (leader_fd, follower_fd) = open_pty().map_err(|e| format!("openpty: {e}"))?;
 
     // Set initial terminal size on the PTY
-    let winsize = libc::winsize {
+    let winsize = rustix::termios::Winsize {
         ws_row: opts.rows,
         ws_col: opts.cols,
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    unsafe {
-        libc::ioctl(leader_fd.as_raw_fd(), libc::TIOCSWINSZ, &winsize);
-    }
+    let _ = rustix::termios::tcsetwinsize(&leader_fd, winsize);
 
     // Spawn child
     let child = spawn_child(&opts.command, follower_fd)
@@ -324,6 +347,8 @@ pub fn run_server(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     // Cleanup
     let _ = std::fs::remove_file(&opts.socket_path);
+    let _ = std::fs::remove_file(&lock_path);
+    // _lock_fd drops here, releasing the flock (though the file is already gone)
     Ok(())
 }
 
@@ -350,10 +375,7 @@ fn bind_listen(path: &std::path::Path) -> io::Result<UnixListener> {
 // Child spawning
 // ---------------------------------------------------------------------------
 
-fn spawn_child(
-    command: &[String],
-    follower_fd: OwnedFd,
-) -> io::Result<std::process::Child> {
+fn spawn_child(command: &[String], follower_fd: OwnedFd) -> io::Result<std::process::Child> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
 
@@ -409,7 +431,7 @@ fn server_mainloop(
 
     // Set up signal self-pipe for SIGCHLD
     let (sig_read, sig_write) = pipe_nonblock()?;
-    signal_hook::low_level::pipe::register(libc::SIGCHLD, sig_write)?;
+    signal_hook::low_level::pipe::register(signal_hook::consts::SIGCHLD, sig_write)?;
 
     let mut read_buf = [0u8; READ_BUF_SIZE];
 
@@ -456,22 +478,27 @@ fn server_mainloop(
 
             // Check if child exited
             if child_running {
-                handle_child_exit(&mut child, &mut child_running, &mut exit_status,
-                                  &mut clients, &mut exit_notified);
+                handle_child_exit(
+                    &mut child,
+                    &mut child_running,
+                    &mut exit_status,
+                    &mut clients,
+                    &mut exit_notified,
+                );
             }
         }
 
         // Accept new clients
-        if revents[0].contains(PollFlags::IN) {
-            if let Ok((stream, _)) = listener.accept() {
-                let fd = OwnedFd::from(stream);
-                // Verify peer UID before accepting
-                if verify_peer_uid(&fd).is_err() {
-                    drop(fd); // reject connection
-                } else {
-                    rustix::fs::fcntl_setfl(&fd, rustix::fs::OFlags::NONBLOCK).ok();
-                    clients.push(ServerClient::new(fd));
-                }
+        if revents[0].contains(PollFlags::IN)
+            && let Ok((stream, _)) = listener.accept()
+        {
+            let fd = OwnedFd::from(stream);
+            // Verify peer UID before accepting
+            if verify_peer_uid(&fd).is_err() {
+                drop(fd); // reject connection
+            } else {
+                rustix::fs::fcntl_setfl(&fd, rustix::fs::OFlags::NONBLOCK).ok();
+                clients.push(ServerClient::new(fd));
             }
         }
 
@@ -487,14 +514,24 @@ fn server_mainloop(
                 }
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                     // PTY closed — child exited
-                    handle_child_exit(&mut child, &mut child_running, &mut exit_status,
-                                      &mut clients, &mut exit_notified);
+                    handle_child_exit(
+                        &mut child,
+                        &mut child_running,
+                        &mut exit_status,
+                        &mut clients,
+                        &mut exit_notified,
+                    );
                 }
                 Err(e) => {
                     // EIO is common on macOS when child exits
-                    if e.raw_os_error() == Some(libc::EIO) {
-                        handle_child_exit(&mut child, &mut child_running, &mut exit_status,
-                                          &mut clients, &mut exit_notified);
+                    if e.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error()) {
+                        handle_child_exit(
+                            &mut child,
+                            &mut child_running,
+                            &mut exit_status,
+                            &mut clients,
+                            &mut exit_notified,
+                        );
                     }
                     // else: ignore transient errors
                 }
@@ -504,13 +541,12 @@ fn server_mainloop(
         // Process client I/O
         let mut to_remove: Vec<usize> = Vec::new();
 
-        for ci in 0..clients.len() {
+        for (ci, client) in clients.iter_mut().enumerate() {
             let poll_idx = 3 + ci;
             if poll_idx >= revents.len() {
                 break;
             }
             let rev = revents[poll_idx];
-            let client = &mut clients[ci];
 
             // Handle disconnection
             if rev.intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL)
@@ -531,7 +567,7 @@ fn server_mainloop(
                     exit_status,
                     &mut exit_notified,
                 ) {
-                    Ok(true) => {}  // continue
+                    Ok(true) => {} // continue
                     Ok(false) | Err(_) => {
                         to_remove.push(ci);
                         continue;
@@ -540,30 +576,28 @@ fn server_mainloop(
             }
 
             // Continue replay if in progress
-            if client.state == ClientState::Replaying {
-                if !continue_replay(client, exit_status, &mut exit_notified) {
-                    to_remove.push(ci);
-                    continue;
-                }
+            if client.state == ClientState::Replaying
+                && !continue_replay(client, exit_status, &mut exit_notified)
+            {
+                to_remove.push(ci);
+                continue;
             }
 
             // Send PTY data to live clients
-            if client.state == ClientState::Live {
-                if let Some(ref data) = pty_data {
-                    let pkt = Packet::content(data);
-                    if !client.queue_packet(&pkt) {
-                        to_remove.push(ci);
-                        continue;
-                    }
+            if client.state == ClientState::Live
+                && let Some(ref data) = pty_data
+            {
+                let pkt = Packet::content(data);
+                if !client.queue_packet(&pkt) {
+                    to_remove.push(ci);
+                    continue;
                 }
             }
 
             // Flush outbound
-            if rev.contains(PollFlags::OUT) || client.has_pending_output() {
-                if !client.flush() {
-                    to_remove.push(ci);
-                    continue;
-                }
+            if (rev.contains(PollFlags::OUT) || client.has_pending_output()) && !client.flush() {
+                to_remove.push(ci);
+                continue;
             }
         }
 
@@ -572,9 +606,7 @@ fn server_mainloop(
 
         // Re-elect controller after any changes
         // (new clients reaching Live, clients removed, etc.)
-        let old_controller_id = clients
-            .iter()
-            .position(|c| c.is_controller);
+        let old_controller_id = clients.iter().position(|c| c.is_controller);
         let mut new_controller_id = None;
         for (i, c) in clients.iter().enumerate().rev() {
             if c.state == ClientState::Live
@@ -621,9 +653,11 @@ fn handle_client_input(
 ) -> io::Result<bool> {
     match client.state {
         ClientState::Connected => {
-            // Expect a Hello
+            // Expect a Hello — the fd is non-blocking, so we may get
+            // WouldBlock if the client hasn't sent it yet.
             let pkt = match protocol::recv_packet(client.fd.as_fd()) {
                 Ok(p) => p,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(true),
                 Err(_) => return Ok(false),
             };
 
@@ -712,6 +746,7 @@ fn handle_client_input(
         ClientState::Live => {
             let pkt = match protocol::recv_packet(client.fd.as_fd()) {
                 Ok(p) => p,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(true),
                 Err(_) => return Ok(false),
             };
 
@@ -722,20 +757,23 @@ fn handle_client_input(
                     }
                 }
                 MsgType::Resize => {
-                    if client.is_controller {
-                        if let Some((rows, cols)) = pkt.parse_resize() {
-                            let ws = libc::winsize {
-                                ws_row: rows,
-                                ws_col: cols,
-                                ws_xpixel: 0,
-                                ws_ypixel: 0,
-                            };
-                            unsafe {
-                                libc::ioctl(leader_fd.as_raw_fd(), libc::TIOCSWINSZ, &ws);
-                                // Signal the child's process group to redraw.
-                                // The child called setsid() so its PGID == its PID.
-                                libc::kill(-(child_pid as libc::pid_t), libc::SIGWINCH);
-                            }
+                    if client.is_controller
+                        && let Some((rows, cols)) = pkt.parse_resize()
+                    {
+                        let ws = rustix::termios::Winsize {
+                            ws_row: rows,
+                            ws_col: cols,
+                            ws_xpixel: 0,
+                            ws_ypixel: 0,
+                        };
+                        let _ = rustix::termios::tcsetwinsize(leader_fd, ws);
+                        // Signal the child's process group to redraw.
+                        // The child called setsid() so its PGID == its PID.
+                        if let Some(pgid) = rustix::process::Pid::from_raw(child_pid as i32) {
+                            let _ = rustix::process::kill_process_group(
+                                pgid,
+                                rustix::process::Signal::WINCH,
+                            );
                         }
                     }
                 }

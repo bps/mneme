@@ -304,9 +304,8 @@ pub fn recv_packet(fd: BorrowedFd<'_>) -> io::Result<Packet> {
     let mut header = [0u8; HEADER_SIZE];
     read_exact_fd(fd, &mut header)?;
 
-    let msg_type = MsgType::from_u8(header[0]).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "unknown message type")
-    })?;
+    let msg_type = MsgType::from_u8(header[0])
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown message type"))?;
     let len = u16::from_le_bytes([header[1], header[2]]) as usize;
     if len > MAX_PAYLOAD {
         return Err(io::Error::new(
@@ -399,7 +398,7 @@ mod tests {
             cols: 80,
         };
         let pkt = Packet::hello(&hello);
-        let (mut r, w) = pipe_pair();
+        let (r, w) = pipe_pair();
         send_packet(w.as_fd(), &pkt).unwrap();
         drop(w);
         let got = recv_packet(r.as_fd()).unwrap();
@@ -424,7 +423,7 @@ mod tests {
             ring_used: 4200,
         };
         let pkt = Packet::welcome(&w);
-        let (mut r, wr) = pipe_pair();
+        let (r, wr) = pipe_pair();
         send_packet(wr.as_fd(), &pkt).unwrap();
         drop(wr);
         let got = recv_packet(r.as_fd()).unwrap();
@@ -440,7 +439,7 @@ mod tests {
     fn roundtrip_content() {
         let data = b"hello world";
         let pkt = Packet::content(data);
-        let (mut r, w) = pipe_pair();
+        let (r, w) = pipe_pair();
         send_packet(w.as_fd(), &pkt).unwrap();
         drop(w);
         let got = recv_packet(r.as_fd()).unwrap();
@@ -452,7 +451,7 @@ mod tests {
     fn roundtrip_empty_messages() {
         for msg_type in [MsgType::ResizeReq, MsgType::Detach, MsgType::ReplayEnd] {
             let pkt = Packet::empty(msg_type);
-            let (mut r, w) = pipe_pair();
+            let (r, w) = pipe_pair();
             send_packet(w.as_fd(), &pkt).unwrap();
             drop(w);
             let got = recv_packet(r.as_fd()).unwrap();
@@ -464,7 +463,7 @@ mod tests {
     #[test]
     fn roundtrip_resize() {
         let pkt = Packet::resize(50, 120);
-        let (mut r, w) = pipe_pair();
+        let (r, w) = pipe_pair();
         send_packet(w.as_fd(), &pkt).unwrap();
         drop(w);
         let got = recv_packet(r.as_fd()).unwrap();
@@ -476,7 +475,7 @@ mod tests {
     #[test]
     fn roundtrip_exit() {
         let pkt = Packet::exit(42);
-        let (mut r, w) = pipe_pair();
+        let (r, w) = pipe_pair();
         send_packet(w.as_fd(), &pkt).unwrap();
         drop(w);
         let got = recv_packet(r.as_fd()).unwrap();
@@ -487,7 +486,7 @@ mod tests {
     fn max_payload() {
         let data = vec![0xAB; MAX_PAYLOAD];
         let pkt = Packet::content(&data);
-        let (mut r, w) = pipe_pair();
+        let (r, w) = pipe_pair();
         send_packet(w.as_fd(), &pkt).unwrap();
         drop(w);
         let got = recv_packet(r.as_fd()).unwrap();
