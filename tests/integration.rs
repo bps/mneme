@@ -79,11 +79,11 @@ impl TestEnv {
 
         let mut child = cmd.spawn().expect("failed to spawn mn");
 
-        if let Some(input) = stdin_bytes {
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(input).ok();
-                drop(stdin);
-            }
+        if let Some(input) = stdin_bytes
+            && let Some(mut stdin) = child.stdin.take()
+        {
+            stdin.write_all(input).ok();
+            drop(stdin);
         }
 
         collect_output(&mut child, Duration::from_secs(timeout_secs))
@@ -104,9 +104,7 @@ impl TestEnv {
     fn server_pid(&self, session: &str) -> Option<u32> {
         let path = self.socket_dir().join(session);
         let stream = UnixStream::connect(&path).ok()?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
 
         // Send a Query Hello
         let hello = mneme::protocol::Hello {
@@ -116,11 +114,8 @@ impl TestEnv {
             rows: 0,
             cols: 0,
         };
-        mneme::protocol::send_packet(
-            stream.as_fd(),
-            &mneme::protocol::Packet::hello(&hello),
-        )
-        .ok()?;
+        mneme::protocol::send_packet(stream.as_fd(), &mneme::protocol::Packet::hello(&hello))
+            .ok()?;
 
         let pkt = mneme::protocol::recv_packet(stream.as_fd()).ok()?;
         let welcome = pkt.parse_welcome()?;
@@ -153,9 +148,9 @@ impl TestEnv {
         // Wait for them to die
         let start = std::time::Instant::now();
         while start.elapsed() < Duration::from_secs(2) {
-            let any_alive = pids.iter().any(|&pid| unsafe {
-                libc::kill(pid as libc::pid_t, 0) == 0
-            });
+            let any_alive = pids
+                .iter()
+                .any(|&pid| unsafe { libc::kill(pid as libc::pid_t, 0) == 0 });
             if !any_alive {
                 break;
             }
@@ -241,8 +236,16 @@ fn create_only_and_list() {
 
     let r = env.run(&[], 5);
     assert_eq!(r.code, 0, "list failed: {}", r.stderr);
-    assert!(r.stdout.contains(&sess), "session not in list: {}", r.stdout);
-    assert!(r.stdout.contains("Active sessions"), "missing header: {}", r.stdout);
+    assert!(
+        r.stdout.contains(&sess),
+        "session not in list: {}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("Active sessions"),
+        "missing header: {}",
+        r.stdout
+    );
 }
 
 #[test]
@@ -251,7 +254,13 @@ fn create_attach_detach() {
     let sess = env.session("create-attach");
 
     // Spawn mn -c, wait for output, then send detach key
-    let mut child = env.spawn(&["create", &sess, "/bin/sh", "-c", "echo HELLO_WORLD; sleep 60"]);
+    let mut child = env.spawn(&[
+        "create",
+        &sess,
+        "/bin/sh",
+        "-c",
+        "echo HELLO_WORLD; sleep 60",
+    ]);
 
     std::thread::sleep(Duration::from_secs(1));
 
@@ -262,7 +271,11 @@ fn create_attach_detach() {
 
     let r = collect_output(&mut child, Duration::from_secs(5));
     assert_eq!(r.code, 0, "create+attach failed: {}", r.stderr);
-    assert!(r.stdout.contains("HELLO_WORLD"), "output missing: stdout='{}'", r.stdout);
+    assert!(
+        r.stdout.contains("HELLO_WORLD"),
+        "output missing: stdout='{}'",
+        r.stdout
+    );
     assert!(r.stderr.contains("detached"), "not detached: {}", r.stderr);
 }
 
@@ -272,7 +285,13 @@ fn replay_on_reattach() {
     let sess = env.session("replay");
 
     let r = env.run_with_stdin(
-        &["create", &sess, "/bin/sh", "-c", "echo LINE_ONE; echo LINE_TWO; echo LINE_THREE; sleep 60"],
+        &[
+            "create",
+            &sess,
+            "/bin/sh",
+            "-c",
+            "echo LINE_ONE; echo LINE_TWO; echo LINE_THREE; sleep 60",
+        ],
         Some(DETACH),
         5,
     );
@@ -282,9 +301,21 @@ fn replay_on_reattach() {
 
     let r = env.run_with_stdin(&["attach", &sess], Some(DETACH), 5);
     assert_eq!(r.code, 0, "reattach failed: {}", r.stderr);
-    assert!(r.stdout.contains("LINE_ONE"), "replay missing LINE_ONE: stdout='{}'", r.stdout);
-    assert!(r.stdout.contains("LINE_TWO"), "replay missing LINE_TWO: stdout='{}'", r.stdout);
-    assert!(r.stdout.contains("LINE_THREE"), "replay missing LINE_THREE: stdout='{}'", r.stdout);
+    assert!(
+        r.stdout.contains("LINE_ONE"),
+        "replay missing LINE_ONE: stdout='{}'",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("LINE_TWO"),
+        "replay missing LINE_TWO: stdout='{}'",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("LINE_THREE"),
+        "replay missing LINE_THREE: stdout='{}'",
+        r.stdout
+    );
 }
 
 #[test]
@@ -294,7 +325,11 @@ fn fast_exit_child() {
 
     let r = env.run(&["create", &sess, "/usr/bin/true"], 5);
     assert_eq!(r.code, 0, "fast exit failed: {}", r.stderr);
-    assert!(r.stderr.contains("exit status 0"), "wrong exit message: {}", r.stderr);
+    assert!(
+        r.stderr.contains("exit status 0"),
+        "wrong exit message: {}",
+        r.stderr
+    );
 }
 
 #[test]
@@ -303,8 +338,16 @@ fn fast_exit_child_nonzero() {
     let sess = env.session("fast-exit-nz");
 
     let r = env.run(&["create", &sess, "/usr/bin/false"], 5);
-    assert_eq!(r.code, 1, "expected exit code 1, got {}: {}", r.code, r.stderr);
-    assert!(r.stderr.contains("exit status 1"), "wrong exit message: {}", r.stderr);
+    assert_eq!(
+        r.code, 1,
+        "expected exit code 1, got {}: {}",
+        r.code, r.stderr
+    );
+    assert!(
+        r.stderr.contains("exit status 1"),
+        "wrong exit message: {}",
+        r.stderr
+    );
 }
 
 #[test]
@@ -318,7 +361,11 @@ fn attach_or_create_new() {
         5,
     );
     assert_eq!(r.code, 0, "-A new failed: {}", r.stderr);
-    assert!(r.stderr.contains("session created"), "missing created msg: {}", r.stderr);
+    assert!(
+        r.stderr.contains("session created"),
+        "missing created msg: {}",
+        r.stderr
+    );
 }
 
 #[test]
@@ -332,7 +379,11 @@ fn attach_or_create_existing() {
 
     let r = env.run_with_stdin(&["auto", &sess], Some(DETACH), 5);
     assert_eq!(r.code, 0, "-A existing failed: {}", r.stderr);
-    assert!(!r.stderr.contains("session created"), "should not re-create: {}", r.stderr);
+    assert!(
+        !r.stderr.contains("session created"),
+        "should not re-create: {}",
+        r.stderr
+    );
     assert!(r.stderr.contains("detached"), "should detach: {}", r.stderr);
 }
 
@@ -348,7 +399,11 @@ fn force_recreate() {
     // Without -f, should fail
     let r = env.run(&["new", &sess, "/bin/sh", "-c", "sleep 60"], 5);
     assert_ne!(r.code, 0, "duplicate create should fail");
-    assert!(r.stderr.contains("already exists"), "wrong error: {}", r.stderr);
+    assert!(
+        r.stderr.contains("already exists"),
+        "wrong error: {}",
+        r.stderr
+    );
 
     // With -f, should succeed
     let r = env.run(&["new", "-f", &sess, "/bin/sh", "-c", "sleep 60"], 5);
@@ -362,7 +417,11 @@ fn quiet_mode() {
 
     let r = env.run(&["new", "-q", &sess, "/bin/sh", "-c", "sleep 60"], 5);
     assert_eq!(r.code, 0, "quiet create failed: {}", r.stderr);
-    assert!(r.stderr.is_empty(), "quiet mode should suppress stderr: '{}'", r.stderr);
+    assert!(
+        r.stderr.is_empty(),
+        "quiet mode should suppress stderr: '{}'",
+        r.stderr
+    );
 }
 
 #[test]
@@ -371,12 +430,20 @@ fn session_cleanup_after_exit() {
     let sess = env.session("cleanup");
 
     let r = env.run(&["create", &sess, "/usr/bin/true"], 5);
-    assert!(r.stderr.contains("exit status 0"), "wrong exit: {}", r.stderr);
+    assert!(
+        r.stderr.contains("exit status 0"),
+        "wrong exit: {}",
+        r.stderr
+    );
 
     // Server should have exited — session gone from list
     std::thread::sleep(Duration::from_millis(500));
     let r = env.run(&[], 5);
-    assert!(!r.stdout.contains(&sess), "exited session should be gone: {}", r.stdout);
+    assert!(
+        !r.stdout.contains(&sess),
+        "exited session should be gone: {}",
+        r.stdout
+    );
 }
 
 #[test]
@@ -384,7 +451,11 @@ fn invalid_session_name_rejected() {
     let env = TestEnv::new();
     let r = env.run(&["create", "bad/name", "/bin/sh"], 5);
     assert_ne!(r.code, 0);
-    assert!(r.stderr.contains("alphanumeric"), "wrong error: {}", r.stderr);
+    assert!(
+        r.stderr.contains("alphanumeric"),
+        "wrong error: {}",
+        r.stderr
+    );
 }
 
 #[test]
@@ -417,4 +488,121 @@ fn missing_session_name() {
         "wrong error: {}",
         r.stderr
     );
+}
+
+// ---------------------------------------------------------------------------
+// Stale session cleanup via lock file
+// ---------------------------------------------------------------------------
+
+/// When a server crashes (SIGKILL, OOM, etc.), its socket and lock files
+/// are left on disk. The next `mn new <name>` must recognize the session
+/// is dead (via the released flock) and transparently recover, rather
+/// than erroring with "session already exists".
+#[test]
+fn create_after_server_killed_recovers() {
+    let env = TestEnv::new();
+    let sess = env.session("crashed");
+
+    // Create a real session and hard-kill its server (simulating a crash).
+    let r = env.run(&["new", &sess, "/bin/sh", "-c", "sleep 60"], 5);
+    assert_eq!(r.code, 0, "first create failed: {}", r.stderr);
+    std::thread::sleep(Duration::from_millis(300));
+
+    let pid = env.server_pid(&sess).expect("server PID not found");
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+
+    // Wait for the kernel to reap and release the lock. flock release is
+    // synchronous on process exit, so this is usually immediate.
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Socket and lock files should still be on disk (no one cleaned up).
+    let sock = env.socket_dir().join(&sess);
+    let lock = env.socket_dir().join(format!("{sess}.lock"));
+    assert!(sock.exists(), "socket should remain after SIGKILL");
+    assert!(lock.exists(), "lock file should remain after SIGKILL");
+
+    // Creating again should transparently recover — no -f needed.
+    let r = env.run(&["new", &sess, "/bin/sh", "-c", "sleep 60"], 5);
+    assert_eq!(
+        r.code, 0,
+        "stale-session recovery failed: stderr={}",
+        r.stderr
+    );
+
+    // And the new server should be a different process.
+    std::thread::sleep(Duration::from_millis(300));
+    let new_pid = env.server_pid(&sess).expect("new server PID not found");
+    assert_ne!(new_pid, pid, "expected a fresh server after recovery");
+}
+
+/// A live session must NOT be considered stale — creating with the same
+/// name without -f should still fail, even with the new lock-based check.
+#[test]
+fn create_against_live_session_still_fails() {
+    let env = TestEnv::new();
+    let sess = env.session("live-conflict");
+
+    let r = env.run(&["new", &sess, "/bin/sh", "-c", "sleep 60"], 5);
+    assert_eq!(r.code, 0, "first create failed: {}", r.stderr);
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Duplicate create with live server must fail.
+    let r = env.run(&["new", &sess, "/bin/sh", "-c", "sleep 60"], 5);
+    assert_ne!(
+        r.code, 0,
+        "duplicate create against live session should fail"
+    );
+    assert!(
+        r.stderr.contains("already exists"),
+        "expected 'already exists', got: {}",
+        r.stderr
+    );
+}
+
+/// An orphan lock file (regular file only, no socket) with no holder
+/// should be treated as stale and cleaned up on create.
+#[test]
+fn orphan_lock_file_is_cleaned() {
+    let env = TestEnv::new();
+    let sess = env.session("orphan-lock");
+
+    // Plant an orphan lock file — regular file, no one holds flock on it.
+    let lock = env.socket_dir().join(format!("{sess}.lock"));
+    std::fs::write(&lock, b"").expect("write lock file");
+    assert!(lock.exists());
+
+    // Creating should succeed — no conflicting live server.
+    let r = env.run(&["new", &sess, "/bin/sh", "-c", "sleep 60"], 5);
+    assert_eq!(r.code, 0, "create with orphan lock failed: {}", r.stderr);
+}
+
+/// After normal session termination (child exits, last client detaches),
+/// both socket and lock files should be removed.
+#[test]
+fn files_cleaned_after_clean_exit() {
+    let env = TestEnv::new();
+    let sess = env.session("clean-exit");
+
+    // Short-lived child exits immediately; no clients ever attach.
+    let r = env.run(&["new", &sess, "/bin/sh", "-c", "true"], 5);
+    assert_eq!(r.code, 0, "create failed: {}", r.stderr);
+
+    // The server lingers until a client attaches to pick up the exit
+    // status, so we force a kill to end it. That kill path also
+    // cleans up both files.
+    let _ = env.run(&["kill", &sess], 5);
+
+    let sock = env.socket_dir().join(&sess);
+    let lock = env.socket_dir().join(format!("{sess}.lock"));
+    // Give the server a moment to complete its cleanup.
+    for _ in 0..20 {
+        if !sock.exists() && !lock.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!sock.exists(), "socket file not cleaned up after kill");
+    assert!(!lock.exists(), "lock file not cleaned up after kill");
 }

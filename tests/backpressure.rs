@@ -3,7 +3,7 @@
 //! Verify that a client that stops reading gets disconnected when the
 //! server's per-client outbound buffer exceeds 256 KiB.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -111,9 +111,7 @@ fn slow_client_gets_disconnected() {
     // Try to read — should get either data (if we're still connected)
     // or an error/EOF (if disconnected).
     let mut buf = [0u8; 4096];
-    stream
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .ok();
+    stream.set_read_timeout(Some(Duration::from_secs(1))).ok();
 
     // Drain whatever is in the kernel socket buffer
     let mut total_read = 0;

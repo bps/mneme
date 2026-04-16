@@ -34,7 +34,11 @@ fn start_session(prefix: &str, shell_cmd: &str) -> (TempDir, String, u32) {
         .stderr(Stdio::piped())
         .output()
         .expect("spawn");
-    assert!(output.status.success(), "create failed: {}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "create failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     std::thread::sleep(Duration::from_millis(300));
 
@@ -87,12 +91,7 @@ fn collect_replay(stream: &UnixStream) -> (Vec<u8>, Vec<u8>) {
     let mut replay_done = false;
 
     // Read packets until we hit a timeout or Exit
-    loop {
-        let pkt = match mneme::protocol::recv_packet(stream.as_fd()) {
-            Ok(p) => p,
-            Err(_) => break,
-        };
-
+    while let Ok(pkt) = mneme::protocol::recv_packet(stream.as_fd()) {
         match pkt.msg_type {
             mneme::protocol::MsgType::Replay => {
                 assert!(!replay_done, "Replay packet after ReplayEnd");
@@ -169,7 +168,9 @@ fn replay_preserves_byte_order() {
     let mut last_pos = 0;
     for i in 1..=10 {
         let needle = format!("LINE_{i}");
-        let pos = text.find(&needle).unwrap_or_else(|| panic!("missing {needle} in: {text}"));
+        let pos = text
+            .find(&needle)
+            .unwrap_or_else(|| panic!("missing {needle} in: {text}"));
         assert!(
             pos >= last_pos,
             "LINE_{i} at {pos} is before LINE_{} at {last_pos}",
@@ -214,7 +215,11 @@ fn replay_large_output_chunked_correctly() {
 
     let socket = dir.path().join(&session);
     let (stream, welcome) = attach_raw(&socket);
-    assert!(welcome.ring_used > 4093, "need >4093 bytes for chunking test, got {}", welcome.ring_used);
+    assert!(
+        welcome.ring_used > 4093,
+        "need >4093 bytes for chunking test, got {}",
+        welcome.ring_used
+    );
 
     let mut replay_bytes = Vec::new();
     let mut packet_count = 0;
@@ -236,7 +241,10 @@ fn replay_large_output_chunked_correctly() {
         }
     }
 
-    assert!(packet_count >= 2, "expected multiple Replay packets, got {packet_count}");
+    assert!(
+        packet_count >= 2,
+        "expected multiple Replay packets, got {packet_count}"
+    );
     assert_eq!(
         replay_bytes.len(),
         welcome.ring_used as usize,
@@ -258,9 +266,7 @@ fn live_data_arrives_after_replay_end() {
         libc::mkfifo(c_path.as_ptr(), 0o600);
     }
 
-    let cmd = format!(
-        "echo BEFORE_REPLAY; cat {fifo_path}; sleep 60"
-    );
+    let cmd = format!("echo BEFORE_REPLAY; cat {fifo_path}; sleep 60");
     let (dir, session, pid) = start_session("live-after", &cmd);
     std::thread::sleep(Duration::from_millis(500));
 
@@ -285,24 +291,19 @@ fn live_data_arrives_after_replay_end() {
     }
 
     // Read live Content
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .ok();
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
     let mut live = Vec::new();
-    loop {
-        match mneme::protocol::recv_packet(stream.as_fd()) {
-            Ok(pkt) => match pkt.msg_type {
-                mneme::protocol::MsgType::Content => {
-                    live.extend_from_slice(&pkt.payload);
-                    let text = String::from_utf8_lossy(&live);
-                    if text.contains("AFTER_REPLAY") {
-                        break;
-                    }
+    while let Ok(pkt) = mneme::protocol::recv_packet(stream.as_fd()) {
+        match pkt.msg_type {
+            mneme::protocol::MsgType::Content => {
+                live.extend_from_slice(&pkt.payload);
+                let text = String::from_utf8_lossy(&live);
+                if text.contains("AFTER_REPLAY") {
+                    break;
                 }
-                mneme::protocol::MsgType::Exit => break,
-                _ => {}
-            },
-            Err(_) => break,
+            }
+            mneme::protocol::MsgType::Exit => break,
+            _ => {}
         }
     }
 
@@ -329,7 +330,10 @@ fn second_attach_gets_full_replay_including_first_session_output() {
         let (stream, _) = attach_raw(&socket);
         let (replay, _) = collect_replay(&stream);
         let text = String::from_utf8_lossy(&replay);
-        assert!(text.contains("ORIGINAL_OUTPUT"), "first attach missing output: '{text}'");
+        assert!(
+            text.contains("ORIGINAL_OUTPUT"),
+            "first attach missing output: '{text}'"
+        );
         // Detach
         mneme::protocol::send_packet(
             stream.as_fd(),
@@ -366,11 +370,7 @@ fn no_replay_content_before_replay_end() {
     let mut got_replay_end = false;
     stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
 
-    loop {
-        let pkt = match mneme::protocol::recv_packet(stream.as_fd()) {
-            Ok(p) => p,
-            Err(_) => break,
-        };
+    while let Ok(pkt) = mneme::protocol::recv_packet(stream.as_fd()) {
         match pkt.msg_type {
             mneme::protocol::MsgType::Replay => {
                 assert!(!got_replay_end, "Replay after ReplayEnd");

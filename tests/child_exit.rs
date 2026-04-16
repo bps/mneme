@@ -97,11 +97,7 @@ fn attach_and_collect(socket: &Path) -> AttachResult {
         got_replay_end: false,
     };
 
-    loop {
-        let pkt = match mneme::protocol::recv_packet(s.as_fd()) {
-            Ok(p) => p,
-            Err(_) => break,
-        };
+    while let Ok(pkt) = mneme::protocol::recv_packet(s.as_fd()) {
         match pkt.msg_type {
             mneme::protocol::MsgType::Welcome => {
                 result.welcome = pkt.parse_welcome();
@@ -160,18 +156,27 @@ fn normal_exit_zero() {
     std::thread::sleep(Duration::from_millis(500));
 
     // Server should still be alive (no client notified yet)
-    assert!(server_alive(pid), "server should stay alive until client notified");
+    assert!(
+        server_alive(pid),
+        "server should stay alive until client notified"
+    );
 
     // Attach — should get replay + Exit(0)
     let r = attach_and_collect(&socket);
     assert!(r.got_replay_end, "missing ReplayEnd");
     assert_eq!(r.exit_status, Some(0), "expected exit status 0");
     let text = String::from_utf8_lossy(&r.replay_bytes);
-    assert!(text.contains("DONE"), "replay should contain child output: '{text}'");
+    assert!(
+        text.contains("DONE"),
+        "replay should contain child output: '{text}'"
+    );
 
     // Now the server should exit (client was notified)
     std::thread::sleep(Duration::from_millis(500));
-    assert!(!server_alive(pid), "server should exit after client notification");
+    assert!(
+        !server_alive(pid),
+        "server should exit after client notification"
+    );
 }
 
 #[test]
@@ -232,7 +237,10 @@ fn exited_session_queryable() {
     assert_eq!(r.exit_status, Some(0));
 
     std::thread::sleep(Duration::from_millis(500));
-    assert!(!server_alive(pid), "server should exit after attach notification");
+    assert!(
+        !server_alive(pid),
+        "server should exit after attach notification"
+    );
 }
 
 #[test]
@@ -255,7 +263,11 @@ fn exited_session_attachable_multiple_times() {
     // If server is still alive, a second attach should also work
     if server_alive(pid) {
         let r2 = attach_and_collect(&socket);
-        assert_eq!(r2.exit_status, Some(7), "second attach should also get exit status");
+        assert_eq!(
+            r2.exit_status,
+            Some(7),
+            "second attach should also get exit status"
+        );
     }
     // Either way, this is fine — the design says server exits after
     // "no clients + at least one notified"
@@ -400,18 +412,18 @@ fn exit_during_live_session() {
 
     // Should receive Exit packet
     let mut exit_status = None;
-    loop {
-        let pkt = match mneme::protocol::recv_packet(s.as_fd()) {
-            Ok(p) => p,
-            Err(_) => break,
-        };
+    while let Ok(pkt) = mneme::protocol::recv_packet(s.as_fd()) {
         if pkt.msg_type == mneme::protocol::MsgType::Exit {
             exit_status = pkt.parse_exit_status();
             break;
         }
     }
 
-    assert_eq!(exit_status, Some(3), "should get exit status 3 from live session");
+    assert_eq!(
+        exit_status,
+        Some(3),
+        "should get exit status 3 from live session"
+    );
 
     drop(s);
     let _ = std::fs::remove_file(&fifo);

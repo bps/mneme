@@ -71,12 +71,8 @@ impl ServerFixture {
     /// Connect a raw Unix socket to the server.
     fn connect(&self) -> UnixStream {
         let stream = UnixStream::connect(self.socket_path()).expect("connect failed");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .ok();
-        stream
-            .set_write_timeout(Some(Duration::from_secs(2)))
-            .ok();
+        stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+        stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
         stream
     }
 
@@ -97,9 +93,7 @@ impl Drop for ServerFixture {
 
 fn query_pid(socket_path: &Path) -> Option<u32> {
     let stream = UnixStream::connect(socket_path).ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
     let hello = mneme::protocol::Hello {
         version: mneme::protocol::PROTOCOL_VERSION,
         intent: mneme::protocol::Intent::Query,
@@ -107,11 +101,7 @@ fn query_pid(socket_path: &Path) -> Option<u32> {
         rows: 0,
         cols: 0,
     };
-    mneme::protocol::send_packet(
-        stream.as_fd(),
-        &mneme::protocol::Packet::hello(&hello),
-    )
-    .ok()?;
+    mneme::protocol::send_packet(stream.as_fd(), &mneme::protocol::Packet::hello(&hello)).ok()?;
     let pkt = mneme::protocol::recv_packet(stream.as_fd()).ok()?;
     pkt.parse_welcome().map(|w| w.server_pid)
 }
@@ -121,6 +111,7 @@ fn query_pid(socket_path: &Path) -> Option<u32> {
 // ---------------------------------------------------------------------------
 
 /// Send raw bytes on a stream.
+#[allow(dead_code)]
 fn send_raw(stream: &mut UnixStream, bytes: &[u8]) {
     stream.write_all(bytes).expect("raw write failed");
 }
@@ -136,6 +127,7 @@ fn raw_packet(msg_type: u8, payload: &[u8]) -> Vec<u8> {
 }
 
 /// Try to read a response. Returns the bytes read (may be empty on timeout).
+#[allow(dead_code)]
 fn read_response(stream: &mut UnixStream) -> Vec<u8> {
     let mut buf = vec![0u8; 4096];
     match stream.read(&mut buf) {
@@ -188,7 +180,10 @@ fn parse_resize_too_short() {
 #[test]
 fn parse_exit_too_short() {
     let pkt = mneme::protocol::Packet::new(mneme::protocol::MsgType::Exit, vec![1]);
-    assert!(pkt.parse_exit_status().is_none(), "should reject short payload");
+    assert!(
+        pkt.parse_exit_status().is_none(),
+        "should reject short payload"
+    );
 }
 
 #[test]
@@ -251,18 +246,14 @@ fn server_rejects_wrong_version() {
         rows: 24,
         cols: 80,
     };
-    mneme::protocol::send_packet(stream.as_fd(), &mneme::protocol::Packet::hello(&hello))
-        .unwrap();
+    mneme::protocol::send_packet(stream.as_fd(), &mneme::protocol::Packet::hello(&hello)).unwrap();
 
     // Should get an Error response
     let pkt = recv_typed(&stream);
     match pkt {
         Some(p) if p.msg_type == mneme::protocol::MsgType::Error => {
             let msg = p.parse_error().unwrap_or_default();
-            assert!(
-                msg.contains("version mismatch"),
-                "wrong error: {msg}"
-            );
+            assert!(msg.contains("version mismatch"), "wrong error: {msg}");
         }
         Some(p) => panic!("expected Error, got {:?}", p.msg_type),
         None => {} // server disconnected, also acceptable
@@ -388,8 +379,7 @@ fn query_then_attach_same_session() {
         rows: 24,
         cols: 80,
     };
-    mneme::protocol::send_packet(stream.as_fd(), &mneme::protocol::Packet::hello(&hello))
-        .unwrap();
+    mneme::protocol::send_packet(stream.as_fd(), &mneme::protocol::Packet::hello(&hello)).unwrap();
 
     // Should get Welcome
     let pkt = recv_typed(&stream).expect("no Welcome");
@@ -404,4 +394,139 @@ fn query_then_attach_same_session() {
 
     drop(stream);
     assert!(fix.server_alive(), "server died after query+attach");
+}
+
+// ---------------------------------------------------------------------------
+// Resize boundary value tests (protocol-level, no server needed)
+// ---------------------------------------------------------------------------
+
+fn pipe_pair() -> (std::fs::File, std::fs::File) {
+    let (r, w) = rustix::pipe::pipe().unwrap();
+    (std::fs::File::from(r), std::fs::File::from(w))
+}
+
+#[test]
+fn resize_roundtrip_zero() {
+    let pkt = mneme::protocol::Packet::resize(0, 0);
+    let (r, w) = pipe_pair();
+    mneme::protocol::send_packet(w.as_fd(), &pkt).unwrap();
+    drop(w);
+    let got = mneme::protocol::recv_packet(r.as_fd()).unwrap();
+    let (rows, cols) = got.parse_resize().unwrap();
+    assert_eq!((rows, cols), (0, 0));
+}
+
+#[test]
+fn resize_roundtrip_one() {
+    let pkt = mneme::protocol::Packet::resize(1, 1);
+    let (r, w) = pipe_pair();
+    mneme::protocol::send_packet(w.as_fd(), &pkt).unwrap();
+    drop(w);
+    let got = mneme::protocol::recv_packet(r.as_fd()).unwrap();
+    let (rows, cols) = got.parse_resize().unwrap();
+    assert_eq!((rows, cols), (1, 1));
+}
+
+#[test]
+fn resize_roundtrip_max_u16() {
+    let pkt = mneme::protocol::Packet::resize(u16::MAX, u16::MAX);
+    let (r, w) = pipe_pair();
+    mneme::protocol::send_packet(w.as_fd(), &pkt).unwrap();
+    drop(w);
+    let got = mneme::protocol::recv_packet(r.as_fd()).unwrap();
+    let (rows, cols) = got.parse_resize().unwrap();
+    assert_eq!((rows, cols), (u16::MAX, u16::MAX));
+}
+
+#[test]
+fn resize_roundtrip_asymmetric() {
+    // Verify rows and cols aren't swapped in encode/decode
+    let pkt = mneme::protocol::Packet::resize(1, 999);
+    let (r, w) = pipe_pair();
+    mneme::protocol::send_packet(w.as_fd(), &pkt).unwrap();
+    drop(w);
+    let got = mneme::protocol::recv_packet(r.as_fd()).unwrap();
+    let (rows, cols) = got.parse_resize().unwrap();
+    assert_eq!(rows, 1, "rows should be 1");
+    assert_eq!(cols, 999, "cols should be 999");
+}
+
+#[test]
+fn resize_extra_payload_bytes_ignored() {
+    // A Resize packet with extra trailing bytes should still parse the first 4
+    let mut payload = vec![0u8; 8];
+    payload[0..2].copy_from_slice(&50u16.to_le_bytes());
+    payload[2..4].copy_from_slice(&120u16.to_le_bytes());
+    payload[4..8].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]); // extra junk
+    let pkt = mneme::protocol::Packet::new(mneme::protocol::MsgType::Resize, payload);
+    let (rows, cols) = pkt.parse_resize().unwrap();
+    assert_eq!((rows, cols), (50, 120));
+}
+
+// ---------------------------------------------------------------------------
+// Regression: slow Hello must not cause the server to drop the client
+// ---------------------------------------------------------------------------
+
+/// Regression test for the bug where the server set an accepted client fd
+/// to non-blocking and then called recv_packet() in the Connected state.
+/// If the Hello hadn't arrived yet, read_exact_fd returned WouldBlock, which
+/// was treated as a fatal error — the client was silently dropped. If that
+/// client was the only one, the server could then hit its exit condition
+/// after the child exited, tearing down the socket and causing any
+/// subsequent `mn attach` to fail with "Connection refused".
+///
+/// This test connects, delays well past any poll wake-up, and only then
+/// sends Hello. The server must keep the client and complete the handshake.
+#[test]
+fn server_tolerates_delayed_hello() {
+    let fix = ServerFixture::start("delayed-hello");
+    let stream = fix.connect();
+
+    // Give the server time to accept, set non-blocking, and poll.
+    // Pre-fix, the server would read the empty socket, get WouldBlock,
+    // and drop the client during this sleep.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Now send a valid Hello with Attach intent.
+    let hello = mneme::protocol::Hello {
+        version: mneme::protocol::PROTOCOL_VERSION,
+        intent: mneme::protocol::Intent::Attach,
+        flags: mneme::protocol::ClientFlags::empty(),
+        rows: 24,
+        cols: 80,
+    };
+    mneme::protocol::send_packet(stream.as_fd(), &mneme::protocol::Packet::hello(&hello))
+        .expect("send Hello failed");
+
+    // Server must still be there and must reply with Welcome.
+    let pkt = recv_typed(&stream).expect("no response — server dropped us");
+    assert_eq!(
+        pkt.msg_type,
+        mneme::protocol::MsgType::Welcome,
+        "expected Welcome after delayed Hello, got {:?}",
+        pkt.msg_type,
+    );
+    assert!(fix.server_alive(), "server died during delayed handshake");
+}
+
+/// Related regression: a second client must be able to attach even if the
+/// first client is sitting in Connected state (hasn't sent Hello yet).
+/// Pre-fix, the first client would be dropped immediately on connect, and
+/// if the child had already exited, the server would shut down before the
+/// second client's connect(), producing "Connection refused".
+#[test]
+fn second_client_can_attach_while_first_is_pre_hello() {
+    let fix = ServerFixture::start("pre-hello-coexist");
+
+    // First client: connect but do not send Hello yet.
+    let _slow = fix.connect();
+
+    // Give the server a chance to process the accept + poll cycle.
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Second client: should be able to query successfully.
+    let pid = query_pid(&fix.socket_path())
+        .expect("second client could not query — server may have dropped first client and exited");
+    assert_eq!(pid, fix.server_pid);
+    assert!(fix.server_alive(), "server died with slow client connected");
 }

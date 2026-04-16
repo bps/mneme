@@ -130,9 +130,7 @@ fn profile_roundtrip_latency() {
 
         loop {
             let resp = mneme::protocol::recv_packet(stream.as_fd()).unwrap();
-            if resp.msg_type == mneme::protocol::MsgType::Content
-                && resp.payload.contains(&byte)
-            {
+            if resp.msg_type == mneme::protocol::MsgType::Content && resp.payload.contains(&byte) {
                 break;
             }
         }
@@ -166,8 +164,13 @@ fn profile_throughput() {
 
     let output = Command::new(mn_bin())
         .env("MNEME_SOCKET_DIR", dir.path())
-        .args(["new", &session, "/bin/sh", "-c",
-               "sleep 2; while true; do dd if=/dev/zero bs=65536 count=16 2>/dev/null; done"])
+        .args([
+            "new",
+            &session,
+            "/bin/sh",
+            "-c",
+            "sleep 2; while true; do dd if=/dev/zero bs=65536 count=16 2>/dev/null; done",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -232,8 +235,11 @@ fn profile_baseline_pty_latency() {
     let mut follower: libc::c_int = -1;
     assert_eq!(0, unsafe {
         libc::openpty(
-            &mut leader, &mut follower,
-            std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
+            &mut leader,
+            &mut follower,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         )
     });
 
@@ -249,8 +255,8 @@ fn profile_baseline_pty_latency() {
         .spawn()
         .expect("spawn cat");
 
-    use std::os::fd::IntoRawFd;
     use std::io::{Read, Write};
+    use std::os::fd::IntoRawFd;
 
     let mut leader_file = unsafe { std::fs::File::from_raw_fd(leader_fd.into_raw_fd()) };
 
@@ -274,11 +280,7 @@ fn profile_baseline_pty_latency() {
         }
     }
 
-    print_stats(
-        "Baseline PTY latency (cat, no mn)",
-        "µs",
-        &mut latencies_us,
-    );
+    print_stats("Baseline PTY latency (cat, no mn)", "µs", &mut latencies_us);
 
     let _ = child.kill();
     let _ = child.wait();
@@ -295,8 +297,11 @@ fn profile_baseline_pty_throughput() {
     let mut follower: libc::c_int = -1;
     assert_eq!(0, unsafe {
         libc::openpty(
-            &mut leader, &mut follower,
-            std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(),
+            &mut leader,
+            &mut follower,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         )
     });
 
@@ -306,7 +311,10 @@ fn profile_baseline_pty_throughput() {
     let fc1 = follower_fd.try_clone().unwrap();
     let fc2 = follower_fd.try_clone().unwrap();
     let mut child = Command::new("/bin/sh")
-        .args(["-c", "while true; do dd if=/dev/zero bs=65536 count=16 2>/dev/null; done"])
+        .args([
+            "-c",
+            "while true; do dd if=/dev/zero bs=65536 count=16 2>/dev/null; done",
+        ])
         .stdin(Stdio::from(follower_fd))
         .stdout(Stdio::from(fc1))
         .stderr(Stdio::from(fc2))
@@ -318,7 +326,11 @@ fn profile_baseline_pty_throughput() {
 
     unsafe {
         let flags = libc::fcntl(leader_fd.as_raw_fd(), libc::F_GETFL);
-        libc::fcntl(leader_fd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        libc::fcntl(
+            leader_fd.as_raw_fd(),
+            libc::F_SETFL,
+            flags | libc::O_NONBLOCK,
+        );
     }
 
     let raw_fd = leader_fd.as_raw_fd();
