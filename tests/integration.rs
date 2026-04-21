@@ -490,6 +490,37 @@ fn missing_session_name() {
     );
 }
 
+#[test]
+fn server_log_captures_server_stderr_on_spawn_failure() {
+    let env = TestEnv::new();
+    let sess = env.session("server-log");
+    let log_path = env.socket_dir().join("server.log");
+
+    let mut cmd = env.cmd();
+    cmd.env("MNEME_SERVER_LOG", &log_path)
+        .args(["create", &sess, "/definitely/missing/binary"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().expect("failed to spawn mn");
+    let r = collect_output(&mut child, Duration::from_secs(5));
+
+    assert_ne!(r.code, 0, "create should fail");
+
+    let log = std::fs::read_to_string(&log_path).expect("server log missing");
+    assert!(
+        log.contains("mneme: server error:"),
+        "missing server error prefix: {}",
+        log
+    );
+    assert!(
+        log.contains("spawn") || log.contains("/definitely/missing/binary"),
+        "missing spawn details: {}",
+        log
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Stale session cleanup via lock file
 // ---------------------------------------------------------------------------

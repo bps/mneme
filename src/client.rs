@@ -13,7 +13,27 @@ use std::path::Path;
 pub enum AttachResult {
     Detached,
     Exited(u32),
-    IoError,
+    IoError(DisconnectReason),
+}
+
+pub enum DisconnectReason {
+    ServerHungUp,
+    ServerRead(io::Error),
+    ServerWrite(io::Error),
+    ServerError(String),
+    InvalidExitPacket,
+}
+
+impl std::fmt::Display for DisconnectReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ServerHungUp => write!(f, "server hung up"),
+            Self::ServerRead(e) => write!(f, "read from server failed: {e}"),
+            Self::ServerWrite(e) => write!(f, "write to server failed: {e}"),
+            Self::ServerError(msg) => write!(f, "server sent error: {msg}"),
+            Self::InvalidExitPacket => write!(f, "invalid exit packet from server"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -222,8 +242,8 @@ fn client_mainloop(
             let mut sig_buf = [0u8; 64];
             let _ = rustix::io::read(&sig_read, &mut sig_buf);
 
-            if !in_replay {
-                send_resize(&stream)?;
+            if !in_replay && let Err(e) = send_resize(&stream) {
+                return Ok(AttachResult::IoError(DisconnectReason::ServerWrite(e)));
             }
         }
 
@@ -259,8 +279,8 @@ fn client_mainloop(
                 // Send to server (if not readonly)
                 if !flags.contains(ClientFlags::READONLY) {
                     let pkt = Packet::content(&read_buf[..n]);
-                    if protocol::send_packet(stream.as_fd(), &pkt).is_err() {
-                        return Ok(AttachResult::IoError);
+                    if let Err(e) = protocol::send_packet(stream.as_fd(), &pkt) {
+                        return Ok(AttachResult::IoError(DisconnectReason::ServerWrite(e)));
                     }
                 }
             }
@@ -274,7 +294,7 @@ fn client_mainloop(
             let n = match protocol::try_read(stream.as_fd(), &mut read_buf) {
                 Ok(0) => continue, // would block
                 Ok(n) => n,
-                Err(_) => return Ok(AttachResult::IoError),
+                Err(e) => return Ok(AttachResult::IoError(DisconnectReason::ServerRead(e))),
             };
 
             server_buf.extend_from_slice(&read_buf[..n]);
@@ -291,19 +311,26 @@ fn client_mainloop(
                     MsgType::ReplayEnd => {
                         in_replay = false;
                         // Send resize now that we're live
-                        send_resize(&stream)?;
+                        if let Err(e) = send_resize(&stream) {
+                            return Ok(AttachResult::IoError(DisconnectReason::ServerWrite(e)));
+                        }
                     }
                     MsgType::ResizeReq => {
-                        send_resize(&stream)?;
+                        if let Err(e) = send_resize(&stream) {
+                            return Ok(AttachResult::IoError(DisconnectReason::ServerWrite(e)));
+                        }
                     }
                     MsgType::Exit => {
                         if let Some(status) = pkt.parse_exit_status() {
                             return Ok(AttachResult::Exited(status));
                         }
-                        return Ok(AttachResult::IoError);
+                        return Ok(AttachResult::IoError(DisconnectReason::InvalidExitPacket));
                     }
                     MsgType::Error => {
-                        return Ok(AttachResult::IoError);
+                        let msg = pkt
+                            .parse_error()
+                            .unwrap_or_else(|| "unknown server error".into());
+                        return Ok(AttachResult::IoError(DisconnectReason::ServerError(msg)));
                     }
                     _ => {} // ignore unexpected
                 }
@@ -314,8 +341,26 @@ fn client_mainloop(
         if pollfds[1].revents().contains(PollFlags::HUP)
             && !pollfds[1].revents().contains(PollFlags::IN)
         {
-            return Ok(AttachResult::IoError);
+            return Ok(AttachResult::IoError(DisconnectReason::ServerHungUp));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DisconnectReason;
+
+    #[test]
+    fn disconnect_reason_messages_are_actionable() {
+        assert_eq!(DisconnectReason::ServerHungUp.to_string(), "server hung up");
+        assert_eq!(
+            DisconnectReason::ServerError("boom".into()).to_string(),
+            "server sent error: boom"
+        );
+        assert_eq!(
+            DisconnectReason::InvalidExitPacket.to_string(),
+            "invalid exit packet from server"
+        );
     }
 }
 

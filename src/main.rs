@@ -428,8 +428,17 @@ fn do_create(
         .args(&server_args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
         .process_group(0);
+
+    if let Ok(path) = env::var("MNEME_SERVER_LOG") {
+        let stderr = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        command.stderr(Stdio::from(stderr));
+    } else {
+        command.stderr(Stdio::null());
+    }
 
     let _child = command.spawn()?;
 
@@ -483,9 +492,9 @@ fn do_attach(
             }
             Ok(code as i32)
         }
-        client::AttachResult::IoError => {
+        client::AttachResult::IoError(reason) => {
             if !quiet {
-                eprintln!("mn: {name}: exited due to I/O errors");
+                eprintln!("mn: {name}: exited due to I/O error: {reason}");
             }
             Ok(1)
         }
