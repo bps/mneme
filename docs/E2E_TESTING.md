@@ -62,8 +62,9 @@ fail rather than silently passing via manual signalling.
 
 ### Raw byte matching, not string conversion
 
-The `mn` client enters alternate screen mode and emits escape sequences
-mixed with the child's output.  We keep a `Vec<u8>` buffer and search
+The `mn` client emits raw escape sequences mixed with the child's
+output (ring-buffer replay, plus a soft-reset sequence on detach).
+We keep a `Vec<u8>` buffer and search
 for ASCII byte patterns (`b"READY"`, `b"WINCH 40 100"`) so fragmented
 reads and ANSI sequences can't break marker detection.
 
@@ -82,8 +83,8 @@ hang-up.
 
 ### Drain during wait
 
-On detach, the mn client writes a few bytes (restore termios, exit
-alternate screen) to the PTY follower.  If the test blocks in
+On detach, the mn client writes a few bytes (soft-reset sequence,
+restore termios) to the PTY follower.  If the test blocks in
 `child.wait()` without draining the leader, the PTY buffer can fill
 and the client blocks writing — deadlock.  The test drains the leader
 concurrently with `try_wait()` polling.

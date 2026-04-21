@@ -463,7 +463,7 @@ fn e2e_detach_reattach_resize() {
     pty1.send(b"\x1c");
 
     // Wait for mn attach to exit. Drain the PTY concurrently so the
-    // client's final writes (restore termios, exit alternate screen)
+    // client's final writes (soft reset, restore termios)
     // don't block on a full PTY buffer.
     let wait_start = Instant::now();
     loop {

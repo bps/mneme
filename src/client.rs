@@ -118,11 +118,10 @@ impl RawTerminal {
 
         rustix::termios::tcsetattr(&stdin, rustix::termios::OptionalActions::Now, &raw)?;
 
-        // Enter alternate screen — isolates the session from the shell.
-        // The terminal emulator saves the current screen and cursor state;
-        // on exit we restore it, giving a clean return to the prompt.
-        let stdout = io::stdout();
-        let _ = protocol::write_all_fd(stdout.as_fd(), b"\x1b[?1049h\x1b[H");
+        // Intentionally do NOT enter the alternate screen. The ring-buffer
+        // replay drives the outer terminal into whatever state the child
+        // is in (including altscreen, if a TUI is running), and we want
+        // pre-attach terminal content to remain in scrollback.
 
         Ok(Self { orig })
     }
@@ -130,12 +129,26 @@ impl RawTerminal {
 
 impl Drop for RawTerminal {
     fn drop(&mut self) {
-        // Pop kitty keyboard protocol — this mode stack lives outside
-        // the alternate screen, so the terminal won't restore it for us.
-        // Then exit alternate screen — the terminal emulator restores
-        // the saved screen, cursor, attributes, and all DEC private modes.
+        // Targeted soft reset: guarantee the outer terminal is left in a
+        // usable state regardless of where the child's output stream
+        // stopped (mid-SGR, mid-altscreen, mouse-reporting enabled, etc.).
+        // We deliberately avoid a full RIS (\ec), which would clear
+        // scrollback on some terminals.
+        //
+        //   \e[?1049l   exit altscreen if the child was in it (no-op otherwise)
+        //   \e[<u       pop kitty keyboard protocol
+        //   \e[0m       reset SGR
+        //   \e[?25h     show cursor
+        //   \e[?7h      autowrap on
+        //   \e[?2004l   bracketed paste off
+        //   \e[?1000l..1006l  mouse reporting off (normal, button, any, SGR)
+        //   \e[r        reset scroll region
+        //   \r\n        start the shell prompt on a fresh line
         let stdout = io::stdout();
-        let _ = protocol::write_all_fd(stdout.as_fd(), b"\x1b[<u\x1b[?1049l");
+        let _ = protocol::write_all_fd(
+            stdout.as_fd(),
+            b"\x1b[?1049l\x1b[<u\x1b[0m\x1b[?25h\x1b[?7h\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[r\r\n",
+        );
 
         let stdin = io::stdin();
         let _ =

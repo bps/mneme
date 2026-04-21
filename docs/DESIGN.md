@@ -263,12 +263,21 @@ disconnects.
 The ring buffer replays *raw byte history*. It does not parse escape
 sequences or track terminal state. Consequences:
 
-- Alternate screen content (TUI apps) may replay incorrectly after the
-  app has exited alternate screen mode
 - Partial escape sequences at the oldest buffer boundary may cause brief
   visual artifacts (garbled colors, cursor misposition)
 - Progress bars and CR-redraws replay their full byte history, not just
   the final state
+
+Because the client does not wrap the session in the alternate screen,
+replay drives the outer terminal into whatever state the child is in —
+including altscreen, mouse reporting, or keyboard protocols a TUI app
+has enabled. Pre-attach terminal content is preserved in scrollback; the
+full ring streams into the main screen on attach.
+
+On detach/exit the client issues a targeted soft reset (exit altscreen,
+pop kitty keyboard, reset SGR, show cursor, reset scroll region, disable
+bracketed paste and mouse reporting) so the shell prompt returns usable
+regardless of where in its state machine the child was when we let go.
 
 This is the right trade-off for v1: the primary use case is seeing
 recent shell output after reattaching. For TUI apps, the app itself
@@ -554,8 +563,6 @@ Default command if none given: `$MNEME_CMD`, then `$SHELL`, then `/bin/sh`.
 
 - **Heuristic replay start**: scan backward from ring buffer tail to find
   a clean boundary (last `\n`, last `ESC[0m`) to reduce artifacts
-- **Alternate screen detection**: suppress replay if child was in alternate
-  screen mode (scan for `\e[?1049h` / `\e[?1049l`)
 - **Session hooks**: `MNEME_HOOK` script on create/attach/detach/exit
 - **Advisory sidecar metadata**: `<session>.meta` file for faster listing
   (avoids connecting to each socket), clearly marked as cache
