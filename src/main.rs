@@ -464,6 +464,9 @@ fn do_attach(
     low_priority: bool,
     quiet: bool,
 ) -> Result<i32, Error> {
+    if !session_exists(name)? {
+        return Err(format!("{name}: no such session").into());
+    }
     let socket_path = socket::socket_path(name)?;
     let flags = {
         let mut f = protocol::ClientFlags::empty();
