@@ -4,7 +4,9 @@ use crate::ring::RingBuffer;
 use rustix::event::{PollFd, PollFlags};
 use std::collections::VecDeque;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+#[cfg(target_os = "macos")]
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 
@@ -75,7 +77,7 @@ fn verify_peer_uid(fd: &OwnedFd) -> io::Result<()> {
 #[cfg(target_os = "linux")]
 fn verify_peer_uid(fd: &OwnedFd) -> io::Result<()> {
     let my_uid = rustix::process::getuid().as_raw();
-    let cred = rustix::net::sockopt::get_socket_peercred(fd)?;
+    let cred = rustix::net::sockopt::socket_peercred(fd)?;
     let peer_uid = cred.uid;
     if peer_uid != my_uid {
         return Err(io::Error::new(
