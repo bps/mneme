@@ -86,7 +86,9 @@ fn try_acquire_lock_second_call_returns_none_while_held() {
     let _g = DirGuard::new();
     let path = socket::lock_path("acq-2").unwrap();
 
-    let held = socket::try_acquire_lock(&path).expect("first").expect("some");
+    let held = socket::try_acquire_lock(&path)
+        .expect("first")
+        .expect("some");
 
     // flock is per-open-file-description: a *new* open from the same
     // process trying LOCK_EX|LOCK_NB will get EWOULDBLOCK. Verify by
@@ -97,7 +99,10 @@ fn try_acquire_lock_second_call_returns_none_while_held() {
     drop(held);
     // After release, a fresh acquire succeeds again.
     let third = socket::try_acquire_lock(&path).expect("third call");
-    assert!(third.is_some(), "lock should be re-acquirable after release");
+    assert!(
+        third.is_some(),
+        "lock should be re-acquirable after release"
+    );
     drop(third);
     let _ = std::fs::remove_file(&path);
 }

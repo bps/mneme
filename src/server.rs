@@ -4,9 +4,9 @@ use crate::ring::RingBuffer;
 use rustix::event::{PollFd, PollFlags};
 use std::collections::VecDeque;
 use std::io;
-use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 #[cfg(target_os = "macos")]
 use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 
@@ -78,7 +78,7 @@ fn verify_peer_uid(fd: &OwnedFd) -> io::Result<()> {
 fn verify_peer_uid(fd: &OwnedFd) -> io::Result<()> {
     let my_uid = rustix::process::getuid().as_raw();
     let cred = rustix::net::sockopt::socket_peercred(fd)?;
-    let peer_uid = cred.uid;
+    let peer_uid = cred.uid.as_raw();
     if peer_uid != my_uid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -760,10 +760,8 @@ fn handle_client_input(
             };
 
             match pkt.msg_type {
-                MsgType::Content => {
-                    if !client.flags.contains(ClientFlags::READONLY) {
-                        let _ = protocol::write_all_fd(leader_fd.as_fd(), &pkt.payload);
-                    }
+                MsgType::Content if !client.flags.contains(ClientFlags::READONLY) => {
+                    let _ = protocol::write_all_fd(leader_fd.as_fd(), &pkt.payload);
                 }
                 MsgType::Resize => {
                     if client.is_controller
@@ -923,7 +921,6 @@ fn remove_clients(clients: &mut Vec<ServerClient>, indices: &[usize]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::AsFd;
 
     /// Build a ServerClient backed by one end of a socketpair, in Replaying
     /// state with `replay_size` bytes of payload to send.
@@ -1038,7 +1035,7 @@ mod tests {
 
         // Now manually stuff outbound to nearly full so ReplayEnd won't fit.
         let pad = OUTBOUND_LIMIT - client.outbound.len();
-        client.outbound.extend(std::iter::repeat(0u8).take(pad));
+        client.outbound.extend(std::iter::repeat_n(0u8, pad));
         assert_eq!(client.outbound.len(), OUTBOUND_LIMIT);
 
         // Should backpressure: stay alive, stay in Replaying.

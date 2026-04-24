@@ -346,24 +346,6 @@ fn client_mainloop(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::DisconnectReason;
-
-    #[test]
-    fn disconnect_reason_messages_are_actionable() {
-        assert_eq!(DisconnectReason::ServerHungUp.to_string(), "server hung up");
-        assert_eq!(
-            DisconnectReason::ServerError("boom".into()).to_string(),
-            "server sent error: boom"
-        );
-        assert_eq!(
-            DisconnectReason::InvalidExitPacket.to_string(),
-            "invalid exit packet from server"
-        );
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -422,4 +404,22 @@ fn find_detach_key(buf: &[u8], raw_key: u8, csi_u: &[u8]) -> Option<(usize, usiz
         return Some((pos, 1));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DisconnectReason;
+
+    #[test]
+    fn disconnect_reason_messages_are_actionable() {
+        assert_eq!(DisconnectReason::ServerHungUp.to_string(), "server hung up");
+        assert_eq!(
+            DisconnectReason::ServerError("boom".into()).to_string(),
+            "server sent error: boom"
+        );
+        assert_eq!(
+            DisconnectReason::InvalidExitPacket.to_string(),
+            "invalid exit packet from server"
+        );
+    }
 }
