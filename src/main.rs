@@ -62,6 +62,14 @@ impl From<rustix::io::Errno> for Error {
 }
 
 fn main() {
+    // Ignore SIGPIPE process-wide. Without this, writes to a closed
+    // pipe/socket (e.g. server socket if it vanishes, stdout if the
+    // host terminal closes) kill us with no chance to report a useful
+    // error.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+
     let args: Vec<String> = env::args().collect();
 
     // Internal server mode — not user-facing, not handled by clap
