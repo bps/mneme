@@ -121,7 +121,15 @@ impl std::fmt::Debug for Packet {
 
 impl Packet {
     pub fn new(msg_type: MsgType, payload: Vec<u8>) -> Self {
-        debug_assert!(payload.len() <= MAX_PAYLOAD);
+        // Always-on guard: silently encoding a too-large payload would
+        // produce a packet that recv_packet rejects, surfacing as a
+        // mysterious EOF on the peer. Better to fail loudly here.
+        assert!(
+            payload.len() <= MAX_PAYLOAD,
+            "Packet payload {} exceeds MAX_PAYLOAD {}",
+            payload.len(),
+            MAX_PAYLOAD
+        );
         Self { msg_type, payload }
     }
 

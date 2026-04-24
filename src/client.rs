@@ -288,19 +288,23 @@ fn client_mainloop(
                 if let Some((pos, _len)) = detach_pos {
                     // Send any bytes before the detach key
                     if pos > 0 && !flags.contains(ClientFlags::READONLY) {
-                        let pkt = Packet::content(&read_buf[..pos]);
-                        let _ = protocol::send_packet(stream.as_fd(), &pkt);
+                        for chunk in read_buf[..pos].chunks(protocol::MAX_PAYLOAD) {
+                            let pkt = Packet::content(chunk);
+                            let _ = protocol::send_packet(stream.as_fd(), &pkt);
+                        }
                     }
                     let pkt = Packet::empty(MsgType::Detach);
                     let _ = protocol::send_packet(stream.as_fd(), &pkt);
                     return Ok(AttachResult::Detached);
                 }
 
-                // Send to server (if not readonly)
+                // Send to server (if not readonly), chunked to MAX_PAYLOAD
                 if !flags.contains(ClientFlags::READONLY) {
-                    let pkt = Packet::content(&read_buf[..n]);
-                    if let Err(e) = protocol::send_packet(stream.as_fd(), &pkt) {
-                        return Ok(AttachResult::IoError(DisconnectReason::ServerWrite(e)));
+                    for chunk in read_buf[..n].chunks(protocol::MAX_PAYLOAD) {
+                        let pkt = Packet::content(chunk);
+                        if let Err(e) = protocol::send_packet(stream.as_fd(), &pkt) {
+                            return Ok(AttachResult::IoError(DisconnectReason::ServerWrite(e)));
+                        }
                     }
                 }
             }
