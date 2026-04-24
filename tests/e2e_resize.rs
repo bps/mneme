@@ -590,3 +590,53 @@ fn e2e_resize_controller_handoff() {
     let _ = child_a.wait();
     kill_server(server_pid);
 }
+
+/// Server killed mid-attach: client should detect the hangup and exit
+/// with status 1 (I/O error).  This drives the `DisconnectReason::ServerHungUp`
+/// path in `client_mainloop` and the `IoError(..)` branch in `do_attach`.
+#[test]
+fn e2e_attach_exits_on_server_hangup() {
+    let (dir, session, server_pid) =
+        create_session("e2e-hangup", "/bin/sh -c 'echo READY; sleep 60'");
+
+    let (leader, follower) = open_pty();
+    set_winsize(&leader, 24, 80);
+    let mut child = spawn_mn_attach(dir.path(), &session, follower);
+    let mut pty = PtyReader::new(leader);
+
+    // Wait until we know the client is fully attached & live.
+    assert!(
+        pty.wait_for(b"READY", MARKER_TIMEOUT),
+        "READY not seen before hangup; output: {}",
+        pty.recent_output()
+    );
+
+    // Yank the server out from under the attached client.
+    kill_server(server_pid);
+
+    // Drain PTY output during the wait so the client doesn't block on
+    // stdout writes (e.g. the "I/O error" message + cursor restore).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let exit_status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(s) => break s,
+            None => {
+                // Drain a little to keep the PTY from backpressuring.
+                pty.drain(Duration::from_millis(50));
+                if Instant::now() >= deadline {
+                    eprintln!("PTY tail: {}", pty.recent_output());
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("mn attach did not exit after server hangup");
+                }
+            }
+        }
+    };
+
+    // do_attach returns Ok(1) for any IoError disconnect reason.
+    assert_eq!(
+        exit_status.code(),
+        Some(1),
+        "expected exit code 1 (I/O error) after server hangup, got {exit_status:?}"
+    );
+}
