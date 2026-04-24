@@ -248,3 +248,85 @@ fn session_resumes_when_slow_client_drains() {
     drop(slow);
     kill_server(pid);
 }
+
+#[test]
+fn large_startup_burst_does_not_drop_attached_client() {
+    // Regression for the `mn c pta pi -c` failure: a TUI like pi -c
+    // dumps a large render burst (>>256 KiB of escape sequences with
+    // colors and hyperlinks) right when the client connects. Under the
+    // old policy (drop at OUTBOUND_LIMIT = 256 KiB plus SO_SNDBUF cap)
+    // the only attached client was kicked off mid-burst and saw
+    // "exited due to I/O error: read from server failed: unexpected
+    // end of file".
+    //
+    // With PTY backpressure the server pauses the producer instead.
+    // The client must receive every byte and stay connected.
+    //
+    // We use `head -c 1048576 /dev/zero` which produces exactly 1 MiB
+    // and then exits cleanly. That's >4× the old 256 KiB ceiling and
+    // >3× the old cap+sndbuf ceiling, so it would reliably trip the
+    // pre-fix drop. The reader pauses briefly each iteration to mimic
+    // a human-paced terminal that can't keep up with a flat-out memcpy
+    // from /dev/zero.
+    const TOTAL: usize = 1024 * 1024;
+    // The child sleeps briefly so the client has time to attach and
+    // reach Live state BEFORE the burst arrives — that's the window
+    // where the old policy would drop the client (replay-time
+    // backpressure has its own non-dropping logic, so a burst that
+    // happens to be entirely in the snapshot wouldn't trigger).
+    let cmd = format!("sleep 0.6; head -c {TOTAL} /dev/zero; sleep 0.3");
+    let (dir, session, pid) = start_session("burst", &cmd);
+    let socket = dir.path().join(&session);
+
+    let stream = UnixStream::connect(&socket).expect("connect");
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let hello = mneme::protocol::Hello {
+        version: mneme::protocol::PROTOCOL_VERSION,
+        intent: mneme::protocol::Intent::Attach,
+        flags: mneme::protocol::ClientFlags::empty(),
+        rows: 24,
+        cols: 80,
+    };
+    use std::os::fd::AsFd;
+    mneme::protocol::send_packet(stream.as_fd(), &mneme::protocol::Packet::hello(&hello))
+        .expect("send hello");
+
+    // Drain everything the server sends until we either see Exit or
+    // hit a long quiet period. We pause 1 ms after each Content read
+    // to keep our drain rate below the producer's, exercising the
+    // same window that broke pi -c.
+    let mut received = 0usize;
+    let mut got_exit = false;
+    let mut got_replay_end = false;
+    while let Ok(pkt) = mneme::protocol::recv_packet(stream.as_fd()) {
+        match pkt.msg_type {
+            mneme::protocol::MsgType::Welcome => {}
+            mneme::protocol::MsgType::Replay => received += pkt.payload.len(),
+            mneme::protocol::MsgType::ReplayEnd => got_replay_end = true,
+            mneme::protocol::MsgType::Content => {
+                received += pkt.payload.len();
+                std::thread::sleep(Duration::from_millis(1)); // human-pace
+            }
+            mneme::protocol::MsgType::Exit => {
+                got_exit = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    assert!(got_replay_end, "never saw ReplayEnd");
+    assert!(
+        got_exit,
+        "client was disconnected before child Exit packet \
+         (received {received} of {TOTAL} bytes)"
+    );
+    assert!(
+        received >= TOTAL,
+        "lost data: received {received} bytes, expected at least {TOTAL}"
+    );
+    assert!(server_alive(pid), "server crashed");
+
+    drop(stream);
+    kill_server(pid);
+}
