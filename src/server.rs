@@ -288,15 +288,9 @@ pub fn run_server(args: &[String]) -> Result<(), crate::Error> {
     // thing is that stdio is /dev/null and we're in a new process group.
     let _ = rustix::process::setsid();
 
-    // Ignore SIGHUP as defense in depth; ignore SIGPIPE so that writes
-    // to a PTY leader whose follower has closed (or to a client socket
-    // whose peer has gone away) return EPIPE instead of killing the
-    // server. Without this, the next stray client byte forwarded to a
-    // dead child kills the server before it can send Exit, and clients
-    // see a mysterious "unexpected end of file".
+    // Ignore SIGHUP as defense in depth
     unsafe {
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
-        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 
     // Acquire the session lock BEFORE binding. The lock file lives next
