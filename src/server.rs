@@ -137,6 +137,13 @@ impl ServerClient {
         true
     }
 
+    /// Returns true if `extra` more bytes would fit in outbound without
+    /// exceeding the per-client limit. Used by the replay path to apply
+    /// backpressure instead of dropping the client.
+    fn outbound_has_room(&self, extra: usize) -> bool {
+        self.outbound.len() + extra <= OUTBOUND_LIMIT
+    }
+
     /// Try to flush the outbound buffer. Returns false on fatal error.
     fn flush(&mut self) -> bool {
         while !self.outbound.is_empty() {
@@ -800,18 +807,27 @@ fn continue_replay(
     if let Some(ref buf) = client.replay_buf {
         let remaining = buf.len() - client.replay_pos;
         if remaining == 0 {
-            client.replay_buf = None;
+            // Gate the ReplayEnd (and any follow-on Exit) on outbound
+            // having room — same backpressure rule as the chunk loop
+            // below. Returning true keeps the client alive; we'll retry
+            // next iteration after flush() drains some bytes.
             let end_pkt = Packet::empty(MsgType::ReplayEnd);
-            if !client.queue_packet(&end_pkt) {
-                return false;
+            let mut needed = end_pkt.encode().len();
+            let exit_pkt = exit_status.map(Packet::exit);
+            if let Some(ref p) = exit_pkt {
+                needed += p.encode().len();
             }
+            if !client.outbound_has_room(needed) {
+                return true; // backpressure
+            }
+
+            client.replay_buf = None;
+            // queue_packet cannot fail here — we just verified room.
+            client.queue_packet(&end_pkt);
             client.state = ClientState::Live;
 
-            if let Some(status) = exit_status {
-                let exit_pkt = Packet::exit(status);
-                if !client.queue_packet(&exit_pkt) {
-                    return false;
-                }
+            if let Some(p) = exit_pkt {
+                client.queue_packet(&p);
                 *exit_notified = true;
             }
 
@@ -827,9 +843,15 @@ fn continue_replay(
         let chunk_size = remaining.min(protocol::MAX_PAYLOAD);
         let chunk = &buf[client.replay_pos..client.replay_pos + chunk_size];
         let pkt = Packet::replay(chunk);
-        if !client.queue_packet(&pkt) {
-            return false;
+        // Backpressure: if outbound doesn't have room for this chunk,
+        // skip queueing this iteration. has_pending_output() keeps
+        // POLLOUT registered, so we'll be re-polled when the client
+        // drains and flush() makes room.
+        if !client.outbound_has_room(pkt.encode().len()) {
+            return true;
         }
+        // queue_packet cannot fail — we just verified room.
+        client.queue_packet(&pkt);
         client.replay_pos += chunk_size;
     }
 
@@ -889,5 +911,145 @@ fn remove_clients(clients: &mut Vec<ServerClient>, indices: &[usize]) {
         if i < clients.len() {
             clients.remove(i);
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::AsFd;
+
+    /// Build a ServerClient backed by one end of a socketpair, in Replaying
+    /// state with `replay_size` bytes of payload to send.
+    fn replaying_client(replay_size: usize) -> (ServerClient, std::os::unix::net::UnixStream) {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        // The "server" side: nonblocking, owned by ServerClient.
+        a.set_nonblocking(true).unwrap();
+        let owned = OwnedFd::from(a);
+        let mut c = ServerClient::new(owned);
+        c.replay_buf = Some(vec![0xABu8; replay_size]);
+        c.state = ClientState::Replaying;
+        // Return the peer end so the test holds it open (and can drain).
+        (c, b)
+    }
+
+    /// Regression: when a slow client lets the server's per-client outbound
+    /// queue fill up during replay, `continue_replay` must back-pressure
+    /// (return true without queueing) instead of returning false (which the
+    /// main loop interprets as "drop this client"). Before the fix, the
+    /// server would close brand-new attaches to busy sessions with
+    /// "unexpected end of file".
+    #[test]
+    fn continue_replay_backpressures_when_outbound_full() {
+        // Replay larger than OUTBOUND_LIMIT so we must definitely block.
+        let (mut client, _peer) = replaying_client(OUTBOUND_LIMIT * 2);
+        let mut notified = false;
+
+        // Drive continue_replay repeatedly without ever flushing. With the
+        // bug it returned false once outbound exceeded OUTBOUND_LIMIT and
+        // the server dropped the client. With the fix it must keep
+        // returning true and just stop growing the queue.
+        for i in 0..1_000 {
+            let alive = continue_replay(&mut client, None, &mut notified);
+            assert!(
+                alive,
+                "continue_replay returned false on iteration {i} \
+                 (outbound={}, replay_pos={}) — slow attach would be dropped",
+                client.outbound.len(),
+                client.replay_pos
+            );
+            assert!(
+                client.outbound.len() <= OUTBOUND_LIMIT,
+                "outbound exceeded limit on iteration {i}: {} > {}",
+                client.outbound.len(),
+                OUTBOUND_LIMIT
+            );
+        }
+
+        // Sanity: we are still in Replaying with progress made and queue
+        // sitting near (but not above) the limit.
+        assert_eq!(client.state, ClientState::Replaying);
+        assert!(client.replay_pos > 0);
+        assert!(client.outbound.len() > OUTBOUND_LIMIT - 2 * protocol::MAX_PAYLOAD);
+    }
+
+    /// After the queue drains, `continue_replay` must resume queueing so
+    /// replay eventually completes. Without this, backpressure could turn
+    /// into a deadlock.
+    #[test]
+    fn continue_replay_resumes_after_drain() {
+        let (mut client, peer) = replaying_client(OUTBOUND_LIMIT * 4);
+        let mut notified = false;
+
+        // Fill outbound.
+        for _ in 0..1_000 {
+            assert!(continue_replay(&mut client, None, &mut notified));
+        }
+        let stalled_pos = client.replay_pos;
+        assert!(client.outbound.len() > OUTBOUND_LIMIT - 2 * protocol::MAX_PAYLOAD);
+
+        // Flush into the socketpair, then drain it on the peer side.
+        assert!(client.flush());
+        peer.set_nonblocking(true).unwrap();
+        use std::io::Read;
+        let mut sink = [0u8; 64 * 1024];
+        let mut total = 0;
+        loop {
+            match (&peer).read(&mut sink) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            }
+        }
+        assert!(total > 0, "peer should have drained some bytes");
+
+        // Now the server-side queue is empty (or nearly so); flush again
+        // to push remaining outbound into the kernel buffer.
+        assert!(client.flush());
+
+        // continue_replay should now make progress past where we stalled.
+        for _ in 0..100 {
+            assert!(continue_replay(&mut client, None, &mut notified));
+        }
+        assert!(
+            client.replay_pos > stalled_pos,
+            "replay_pos did not advance after drain: still {stalled_pos}"
+        );
+    }
+
+    /// `ReplayEnd` (and any trailing `Exit`) must also respect
+    /// backpressure — they should not be silently skipped, but they also
+    /// must not drop the client when the queue is full.
+    #[test]
+    fn continue_replay_end_is_gated_on_outbound_room() {
+        // Tiny replay so we reach the "remaining == 0" branch quickly.
+        let (mut client, _peer) = replaying_client(8);
+        let mut notified = false;
+
+        // Drain the small payload first.
+        assert!(continue_replay(&mut client, None, &mut notified));
+
+        // Now manually stuff outbound to nearly full so ReplayEnd won't fit.
+        let pad = OUTBOUND_LIMIT - client.outbound.len();
+        client.outbound.extend(std::iter::repeat(0u8).take(pad));
+        assert_eq!(client.outbound.len(), OUTBOUND_LIMIT);
+
+        // Should backpressure: stay alive, stay in Replaying.
+        assert!(continue_replay(&mut client, None, &mut notified));
+        assert_eq!(client.state, ClientState::Replaying);
+        assert!(client.replay_buf.is_some());
+
+        // Drop a few bytes to simulate flush progress.
+        client.outbound.drain(..16);
+
+        // Now ReplayEnd fits → state transitions to Live.
+        assert!(continue_replay(&mut client, None, &mut notified));
+        assert_eq!(client.state, ClientState::Live);
+        assert!(client.replay_buf.is_none());
     }
 }
