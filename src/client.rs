@@ -219,13 +219,23 @@ fn client_mainloop(
 
     let mut read_buf = [0u8; 4096];
     let mut in_replay = true;
+    // If stdin isn't a TTY (e.g. piped /dev/null), don't treat its EOF
+    // as a detach intent — just stop polling it and wait for the server
+    // to close (e.g. on child exit).
+    let stdin_is_tty = rustix::termios::isatty(&stdin);
+    let mut stdin_eof = false;
 
     // Accumulation buffer for partial packets from server
     let mut server_buf: Vec<u8> = Vec::new();
 
     loop {
+        let stdin_flags = if stdin_eof {
+            PollFlags::empty()
+        } else {
+            PollFlags::IN
+        };
         let mut pollfds: Vec<PollFd<'_>> = vec![
-            PollFd::new(&stdin, PollFlags::IN),
+            PollFd::new(&stdin, stdin_flags),
             PollFd::new(&stream, PollFlags::IN),
             PollFd::new(&sig_read, PollFlags::IN),
         ];
@@ -253,7 +263,17 @@ fn client_mainloop(
             let n = match protocol::try_read(stdin.as_fd(), &mut read_buf) {
                 Ok(0) => 0, // would block
                 Ok(n) => n,
-                Err(_) => return Ok(AttachResult::Detached), // stdin closed
+                Err(_) => {
+                    if stdin_is_tty {
+                        return Ok(AttachResult::Detached); // stdin closed
+                    } else {
+                        // Non-TTY stdin (e.g. /dev/null) — don't treat
+                        // EOF as a user detach. Stop polling stdin and
+                        // wait for the server to drive the rest.
+                        stdin_eof = true;
+                        0
+                    }
+                }
             };
 
             if n > 0 {

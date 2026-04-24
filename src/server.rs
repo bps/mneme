@@ -506,7 +506,12 @@ fn server_mainloop(
             if verify_peer_uid(&fd).is_err() {
                 drop(fd); // reject connection
             } else {
-                rustix::fs::fcntl_setfl(&fd, rustix::fs::OFlags::NONBLOCK).ok();
+                let _ = rustix::fs::fcntl_setfl(&fd, rustix::fs::OFlags::NONBLOCK);
+                // Cap the kernel send buffer so backpressure is observable
+                // in userspace. Without this, Linux's socket-buffer auto-
+                // tuning can absorb several MiB before write() returns
+                // EAGAIN, defeating the per-client OUTBOUND_LIMIT cap.
+                let _ = rustix::net::sockopt::set_socket_send_buffer_size(&fd, 64 * 1024);
                 clients.push(ServerClient::new(fd));
             }
         }
@@ -592,13 +597,20 @@ fn server_mainloop(
                 continue;
             }
 
-            // Send PTY data to live clients
+            // Send PTY data to live clients (chunked to MAX_PAYLOAD)
             if client.state == ClientState::Live
                 && let Some(ref data) = pty_data
             {
-                let pkt = Packet::content(data);
-                if !client.queue_packet(&pkt) {
-                    to_remove.push(ci);
+                let mut dropped = false;
+                for chunk in data.chunks(protocol::MAX_PAYLOAD) {
+                    let pkt = Packet::content(chunk);
+                    if !client.queue_packet(&pkt) {
+                        to_remove.push(ci);
+                        dropped = true;
+                        break;
+                    }
+                }
+                if dropped {
                     continue;
                 }
             }

@@ -1,7 +1,11 @@
 //! Backpressure tests.
 //!
-//! Verify that a client that stops reading gets disconnected when the
-//! server's per-client outbound buffer exceeds 256 KiB.
+//! Verify that a client which stops reading gets disconnected once the
+//! server's per-client outbound buffer exceeds OUTBOUND_LIMIT (256 KiB).
+//!
+//! These tests rely on the server capping the kernel SO_SNDBUF on
+//! accepted clients to a small value (~64 KiB) so that the in-flight
+//! data ceiling is bounded and observable across platforms.
 
 use std::io::Read;
 use std::os::fd::AsFd;
@@ -87,56 +91,54 @@ fn kill_server(pid: u32) {
     std::thread::sleep(Duration::from_millis(100));
 }
 
+/// Drain a connection (without producing more data) until we see EOF or
+/// an error, with a hard byte cap that is comfortably above the worst-case
+/// in-flight ceiling (kernel SNDBUF + OUTBOUND_LIMIT). Returns the number
+/// of bytes drained and whether we observed disconnection.
+fn drain_until_disconnect(stream: &UnixStream, max_bytes: usize) -> (usize, bool) {
+    stream.set_read_timeout(Some(Duration::from_secs(1))).ok();
+    let mut buf = [0u8; 4096];
+    let mut total = 0usize;
+    while total < max_bytes {
+        match (&*stream).read(&mut buf) {
+            Ok(0) => return (total, true),
+            Ok(n) => total += n,
+            Err(_) => return (total, true),
+        }
+    }
+    (total, false)
+}
+
+// Continuous producer. `exec` replaces the shell with cat so we don't
+// pay fork-exec overhead per chunk; this fills the per-client outbound
+// queue past OUTBOUND_LIMIT well within the test sleep window.
+const FLOOD_CMD: &str = "exec cat /dev/zero";
+
+// Cap on bytes we'll accept from a "supposedly disconnected" client
+// before declaring backpressure broken. Has to exceed kernel SNDBUF
+// (server caps to 64 KiB, kernel may double to 128 KiB) plus
+// OUTBOUND_LIMIT (256 KiB), with a healthy margin.
+const DISCONNECT_BYTE_CAP: usize = 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[test]
 fn slow_client_gets_disconnected() {
-    // Child produces a continuous flood of output (well over 256 KiB)
-    let cmd = "while true; do dd if=/dev/zero bs=4096 count=1 2>/dev/null; done";
-    let (dir, session, pid) = start_session("slow", cmd);
-
+    let (dir, session, pid) = start_session("slow", FLOOD_CMD);
     let socket = dir.path().join(&session);
 
-    // Attach a client and reach Live state
+    // Attach a client and reach Live state, then stop reading. Server
+    // should fill the kernel buffer, then the userspace outbound, then
+    // disconnect us.
     let stream = attach_raw(&socket);
-
-    // Now stop reading. The server will buffer output until it hits the
-    // 256 KiB limit, then disconnect us.
-    // We detect disconnection by attempting to read after a delay —
-    // if the server closed us, read returns 0 or error.
     std::thread::sleep(Duration::from_secs(2));
 
-    // Try to read — should get either data (if we're still connected)
-    // or an error/EOF (if disconnected).
-    let mut buf = [0u8; 4096];
-    stream.set_read_timeout(Some(Duration::from_secs(1))).ok();
-
-    // Drain whatever is in the kernel socket buffer
-    let mut total_read = 0;
-    let mut got_error = false;
-    for _ in 0..1000 {
-        match (&stream).read(&mut buf) {
-            Ok(0) => {
-                got_error = true;
-                break;
-            }
-            Ok(n) => total_read += n,
-            Err(_) => {
-                got_error = true;
-                break;
-            }
-        }
-    }
-
-    // The server should have disconnected us. Either we got an error,
-    // or we got some data but the connection is now dead.
-    // If we read a lot of data without error, the server didn't apply
-    // backpressure.
+    let (total, disconnected) = drain_until_disconnect(&stream, DISCONNECT_BYTE_CAP);
     assert!(
-        got_error,
-        "slow client was not disconnected — read {total_read} bytes without error"
+        disconnected,
+        "slow client was not disconnected — drained {total} bytes without EOF"
     );
 
     // Server should still be alive (one slow client doesn't crash it)
@@ -151,55 +153,54 @@ fn slow_client_gets_disconnected() {
 
 #[test]
 fn fast_client_survives_while_slow_client_dropped() {
-    // Child produces a flood
-    let cmd = "while true; do dd if=/dev/zero bs=4096 count=1 2>/dev/null; done";
-    let (dir, session, pid) = start_session("fast-vs-slow", cmd);
-
+    let (dir, session, pid) = start_session("fast-vs-slow", FLOOD_CMD);
     let socket = dir.path().join(&session);
 
-    // Attach a "slow" client that will never read
+    // Slow client: never reads.
     let slow = attach_raw(&socket);
 
-    // Attach a "fast" client that reads continuously
+    // Fast client: drained continuously by a background thread so it
+    // never falls behind.
     let fast = attach_raw(&socket);
+    let fast_clone = fast.try_clone().expect("clone fast");
+    let fast_reader = std::thread::spawn(move || -> u64 {
+        let mut buf = [0u8; 8192];
+        let mut total: u64 = 0;
+        loop {
+            match (&fast_clone).read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => total += n as u64,
+                Err(_) => break,
+            }
+        }
+        total
+    });
 
-    // Let the slow client fall behind
+    // Let the slow client fall behind.
     std::thread::sleep(Duration::from_secs(2));
 
-    // The fast client should still be able to read
-    fast.set_read_timeout(Some(Duration::from_secs(1))).ok();
-    let mut buf = [0u8; 4096];
-    let n = (&fast).read(&mut buf);
-    assert!(
-        matches!(n, Ok(n) if n > 0),
-        "fast client should still receive data: {n:?}"
-    );
-
-    // Verify the slow client is disconnected
-    slow.set_read_timeout(Some(Duration::from_secs(1))).ok();
-    let mut total = 0;
-    let mut disconnected = false;
-    for _ in 0..1000 {
-        match (&slow).read(&mut buf) {
-            Ok(0) | Err(_) => {
-                disconnected = true;
-                break;
-            }
-            Ok(n) => total += n,
-        }
-    }
+    // Slow client must be disconnected within the byte cap.
+    let (slow_total, disconnected) = drain_until_disconnect(&slow, DISCONNECT_BYTE_CAP);
     assert!(
         disconnected,
-        "slow client should be disconnected — read {total} bytes"
+        "slow client was not disconnected — drained {slow_total} bytes without EOF"
     );
 
-    // Server alive
+    // Server should still be alive.
     assert!(
         unsafe { libc::kill(pid as libc::pid_t, 0) == 0 },
         "server crashed"
     );
 
+    // Tear down: closing the fast client's fd should cause the reader
+    // thread to see EOF when the server eventually closes the peer
+    // (or when we kill the server below).
     drop(fast);
     drop(slow);
     kill_server(pid);
+    let fast_total = fast_reader.join().expect("reader thread");
+    assert!(
+        fast_total > 256 * 1024,
+        "fast client received only {fast_total} bytes — was it backpressured too?"
+    );
 }
