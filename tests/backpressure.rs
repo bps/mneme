@@ -1,24 +1,32 @@
-//! Backpressure tests.
+//! PTY backpressure tests.
 //!
-//! Verify that a client which stops reading gets disconnected once the
-//! server's per-client outbound buffer exceeds OUTBOUND_LIMIT (256 KiB).
+//! With PTY-side backpressure (the server stops reading the PTY when
+//! any live client's userspace outbound is full), slow clients are no
+//! longer dropped. Instead the producer — the child process behind the
+//! PTY — blocks on its writes, which throttles every reader at once.
 //!
-//! These tests rely on the server capping the kernel SO_SNDBUF on
-//! accepted clients to a small value (~64 KiB) so that the in-flight
-//! data ceiling is bounded and observable across platforms.
+//! These tests verify the new semantics:
+//!   * a slow client that stops reading is NOT disconnected,
+//!   * a slow client also throttles fast clients in the same session,
+//!   * once the slow client resumes, the session resumes too.
 
 use std::io::Read;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
 fn mn_bin() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_mn"))
 }
+
+// Continuous producer: avoids fork-exec throttling that "while dd…" suffers
+// from, so the producer rate is high enough to fill any reasonable buffer
+// in a fraction of a second.
+const FLOOD_CMD: &str = "exec cat /dev/zero";
 
 fn start_session(prefix: &str, shell_cmd: &str) -> (TempDir, String, u32) {
     let dir = TempDir::new().expect("tempdir");
@@ -72,15 +80,12 @@ fn attach_raw(socket: &Path) -> UnixStream {
         cols: 80,
     };
     mneme::protocol::send_packet(s.as_fd(), &mneme::protocol::Packet::hello(&hello)).unwrap();
-
-    // Drain Welcome + any Replay + ReplayEnd to reach Live state
     loop {
         let pkt = mneme::protocol::recv_packet(s.as_fd()).unwrap();
         if pkt.msg_type == mneme::protocol::MsgType::ReplayEnd {
             break;
         }
     }
-
     s
 }
 
@@ -91,116 +96,155 @@ fn kill_server(pid: u32) {
     std::thread::sleep(Duration::from_millis(100));
 }
 
-/// Drain a connection (without producing more data) until we see EOF or
-/// an error, with a hard byte cap that is comfortably above the worst-case
-/// in-flight ceiling (kernel SNDBUF + OUTBOUND_LIMIT). Returns the number
-/// of bytes drained and whether we observed disconnection.
-fn drain_until_disconnect(stream: &UnixStream, max_bytes: usize) -> (usize, bool) {
-    stream.set_read_timeout(Some(Duration::from_secs(1))).ok();
-    let mut buf = [0u8; 4096];
-    let mut total = 0usize;
-    while total < max_bytes {
-        match (&*stream).read(&mut buf) {
-            Ok(0) => return (total, true),
-            Ok(n) => total += n,
-            Err(_) => return (total, true),
-        }
-    }
-    (total, false)
+fn server_alive(pid: u32) -> bool {
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
-// Continuous producer. `exec` replaces the shell with cat so we don't
-// pay fork-exec overhead per chunk; this fills the per-client outbound
-// queue past OUTBOUND_LIMIT well within the test sleep window.
-const FLOOD_CMD: &str = "exec cat /dev/zero";
-
-// Cap on bytes we'll accept from a "supposedly disconnected" client
-// before declaring backpressure broken. Has to exceed kernel SNDBUF
-// (server caps to 64 KiB, kernel may double to 128 KiB) plus
-// OUTBOUND_LIMIT (256 KiB), with a healthy margin.
-const DISCONNECT_BYTE_CAP: usize = 1024 * 1024;
+/// Non-draining peek: returns Some(true) if peer has hung up (recv would
+/// return 0), Some(false) if peer is still connected (data buffered or
+/// no data yet), None on weird errors.
+fn peer_hung_up(stream: &UnixStream) -> Option<bool> {
+    let mut buf = [0u8; 1];
+    let r = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if r == 0 {
+        return Some(true);
+    }
+    if r > 0 {
+        return Some(false);
+    }
+    let err = std::io::Error::last_os_error().raw_os_error();
+    match err {
+        Some(libc::EAGAIN) | Some(libc::EINTR) => Some(false),
+        _ => None,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[test]
-fn slow_client_gets_disconnected() {
-    let (dir, session, pid) = start_session("slow", FLOOD_CMD);
+fn slow_client_is_not_disconnected() {
+    // Slow client connects, never reads. With PTY backpressure the server
+    // must NOT drop it; the child blocks on its writes instead.
+    let (dir, session, pid) = start_session("slow-keep", FLOOD_CMD);
     let socket = dir.path().join(&session);
 
-    // Attach a client and reach Live state, then stop reading. Server
-    // should fill the kernel buffer, then the userspace outbound, then
-    // disconnect us.
     let stream = attach_raw(&socket);
-    std::thread::sleep(Duration::from_secs(2));
 
-    let (total, disconnected) = drain_until_disconnect(&stream, DISCONNECT_BYTE_CAP);
-    assert!(
-        disconnected,
-        "slow client was not disconnected — drained {total} bytes without EOF"
-    );
+    // Wait long enough that, under the old "drop at 256 KiB outbound"
+    // policy, the slow client would have been dropped many times over.
+    std::thread::sleep(Duration::from_secs(3));
 
-    // Server should still be alive (one slow client doesn't crash it)
-    assert!(
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 },
-        "server crashed"
-    );
+    match peer_hung_up(&stream) {
+        Some(false) => {} // good — still connected
+        Some(true) => panic!("server hung up on slow client (PTY backpressure not in effect)"),
+        None => panic!("unexpected peer-state error"),
+    }
+
+    assert!(server_alive(pid), "server crashed");
 
     drop(stream);
     kill_server(pid);
 }
 
 #[test]
-fn fast_client_survives_while_slow_client_dropped() {
-    let (dir, session, pid) = start_session("fast-vs-slow", FLOOD_CMD);
+fn slow_client_throttles_fast_client() {
+    // Two clients: one stops reading, one drains continuously. With PTY
+    // backpressure the fast client must visibly slow down (the PTY
+    // producer pauses while the slow client's outbound is full).
+    let (dir, session, pid) = start_session("throttle", FLOOD_CMD);
     let socket = dir.path().join(&session);
 
-    // Slow client: never reads.
+    // Fast client first so its initial replay is small.
+    let fast = attach_raw(&socket);
     let slow = attach_raw(&socket);
 
-    // Fast client: drained continuously by a background thread so it
-    // never falls behind.
-    let fast = attach_raw(&socket);
-    let fast_clone = fast.try_clone().expect("clone fast");
-    let fast_reader = std::thread::spawn(move || -> u64 {
-        let mut buf = [0u8; 8192];
-        let mut total: u64 = 0;
-        loop {
-            match (&fast_clone).read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => total += n as u64,
-                Err(_) => break,
-            }
+    // Baseline: drain fast for 500 ms with no slow-client interference yet
+    // (slow's outbound hasn't filled). Measure throughput.
+    fast.set_read_timeout(Some(Duration::from_millis(50))).ok();
+    let mut buf = [0u8; 8192];
+    let baseline_start = Instant::now();
+    let mut baseline_bytes: u64 = 0;
+    while baseline_start.elapsed() < Duration::from_millis(500) {
+        match (&fast).read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => baseline_bytes += n as u64,
         }
-        total
-    });
+    }
 
-    // Let the slow client fall behind.
-    std::thread::sleep(Duration::from_secs(2));
+    // Now wait for slow's outbound to fill (gives time for kernel SNDBUF
+    // + userspace buffer to saturate; once full, PTY backpressure kicks
+    // in and fast is throttled too).
+    std::thread::sleep(Duration::from_secs(1));
 
-    // Slow client must be disconnected within the byte cap.
-    let (slow_total, disconnected) = drain_until_disconnect(&slow, DISCONNECT_BYTE_CAP);
+    // Measure fast's throughput while slow is stalled.
+    let throttled_start = Instant::now();
+    let mut throttled_bytes: u64 = 0;
+    while throttled_start.elapsed() < Duration::from_millis(500) {
+        match (&fast).read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => throttled_bytes += n as u64,
+        }
+    }
+
+    // The fast client should still be receiving SOMETHING (slow draining
+    // through kernel buffer is still happening), but throughput should be
+    // dramatically lower than baseline once PTY is paused.
     assert!(
-        disconnected,
-        "slow client was not disconnected — drained {slow_total} bytes without EOF"
+        throttled_bytes < baseline_bytes / 4,
+        "fast client wasn't throttled by slow client: baseline={baseline_bytes} \
+         throttled={throttled_bytes}"
     );
 
-    // Server should still be alive.
-    assert!(
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 },
-        "server crashed"
-    );
+    // Both clients must still be connected.
+    assert_eq!(peer_hung_up(&fast), Some(false), "fast client got hung up");
+    assert_eq!(peer_hung_up(&slow), Some(false), "slow client got hung up");
+    assert!(server_alive(pid), "server crashed");
 
-    // Tear down: closing the fast client's fd should cause the reader
-    // thread to see EOF when the server eventually closes the peer
-    // (or when we kill the server below).
     drop(fast);
     drop(slow);
     kill_server(pid);
-    let fast_total = fast_reader.join().expect("reader thread");
+}
+
+#[test]
+fn session_resumes_when_slow_client_drains() {
+    // Slow client stops reading → session pauses. Slow client resumes
+    // reading → session resumes. Verify by measuring bytes read after
+    // resume.
+    let (dir, session, pid) = start_session("resume", FLOOD_CMD);
+    let socket = dir.path().join(&session);
+
+    let slow = attach_raw(&socket);
+    std::thread::sleep(Duration::from_millis(800)); // let buffers fill
+
+    // Now drain aggressively from slow; this should let the PTY resume.
+    slow.set_read_timeout(Some(Duration::from_millis(50))).ok();
+    let mut buf = [0u8; 8192];
+    let drain_start = Instant::now();
+    let mut total: u64 = 0;
+    while drain_start.elapsed() < Duration::from_secs(1) {
+        match (&slow).read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => total += n as u64,
+        }
+    }
+
+    // After 1s of aggressive draining from a /dev/zero source, we should
+    // have read megabytes — far more than just the buffered backlog.
     assert!(
-        fast_total > 256 * 1024,
-        "fast client received only {fast_total} bytes — was it backpressured too?"
+        total > 1024 * 1024,
+        "session didn't resume after slow client drained: only {total} bytes in 1s"
     );
+
+    assert!(server_alive(pid), "server crashed");
+    drop(slow);
+    kill_server(pid);
 }

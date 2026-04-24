@@ -496,6 +496,16 @@ fn do_attach(
             Ok(code as i32)
         }
         client::AttachResult::IoError(reason) => {
+            // Breadcrumb to MNEME_DEBUG so we can correlate with server log
+            if let Ok(path) = env::var("MNEME_DEBUG")
+                && let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+            {
+                use std::io::Write;
+                let _ = writeln!(f, "[mn-cli] AttachResult::IoError: {reason}");
+            }
             if !quiet {
                 eprintln!("mn: {name}: exited due to I/O error: {reason}");
             }

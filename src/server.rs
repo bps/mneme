@@ -277,6 +277,20 @@ fn parse_server_args(args: &[String]) -> io::Result<ServerOpts> {
 
 pub fn run_server(args: &[String]) -> Result<(), crate::Error> {
     let opts = parse_server_args(args)?;
+    eprintln!(
+        "[mn-srv] startup pid={} session={:?} command={:?}",
+        std::process::id(),
+        opts.socket_path.file_name().unwrap_or_default(),
+        opts.command
+    );
+    // Best-effort: also catch panics so we know the server died via panic
+    // even if the log was discarded (Rust's panic message normally goes
+    // to stderr; this just gives us a final breadcrumb with the location).
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        eprintln!("[mn-srv] PANIC: {info}");
+        default_hook(info);
+    }));
 
     // Take ownership of the ready fd and set CLOEXEC so the child doesn't inherit it
     let ready_fd = unsafe { OwnedFd::from_raw_fd(opts.ready_fd) };
@@ -357,6 +371,7 @@ pub fn run_server(args: &[String]) -> Result<(), crate::Error> {
     // Cleanup
     let _ = std::fs::remove_file(&opts.socket_path);
     let _ = std::fs::remove_file(&lock_path);
+    eprintln!("[mn-srv] exit clean");
     // _lock_fd drops here, releasing the flock (though the file is already gone)
     Ok(())
 }
@@ -450,8 +465,17 @@ fn server_mainloop(
 
         // [0] = listener
         pollfds.push(PollFd::new(&listener, PollFlags::IN));
-        // [1] = PTY leader (only read if child is running)
-        let pty_flags = if child_running {
+        // [1] = PTY leader. We pause reads from the PTY when any LIVE
+        // client doesn't have room in its userspace outbound buffer for
+        // a max-sized read. This applies backpressure all the way to the
+        // child (its writes will block on the PTY) instead of dropping
+        // slow clients. With zero live clients we always read so the
+        // ring buffer keeps filling for future attaches.
+        let pty_paused = clients
+            .iter()
+            .filter(|c| c.state == ClientState::Live)
+            .any(|c| !c.outbound_has_room(READ_BUF_SIZE));
+        let pty_flags = if child_running && !pty_paused {
             PollFlags::IN
         } else {
             PollFlags::empty()
@@ -507,11 +531,6 @@ fn server_mainloop(
                 drop(fd); // reject connection
             } else {
                 let _ = rustix::fs::fcntl_setfl(&fd, rustix::fs::OFlags::NONBLOCK);
-                // Cap the kernel send buffer so backpressure is observable
-                // in userspace. Without this, Linux's socket-buffer auto-
-                // tuning can absorb several MiB before write() returns
-                // EAGAIN, defeating the per-client OUTBOUND_LIMIT cap.
-                let _ = rustix::net::sockopt::set_socket_send_buffer_size(&fd, 64 * 1024);
                 clients.push(ServerClient::new(fd));
             }
         }
@@ -566,6 +585,10 @@ fn server_mainloop(
             if rev.intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL)
                 && !rev.contains(PollFlags::IN)
             {
+                eprintln!(
+                    "[mn-srv] drop client {ci}: poll revents={rev:?} state={:?}",
+                    client.state
+                );
                 to_remove.push(ci);
                 continue;
             }
@@ -583,6 +606,10 @@ fn server_mainloop(
                 ) {
                     Ok(true) => {} // continue
                     Ok(false) | Err(_) => {
+                        eprintln!(
+                            "[mn-srv] drop client {ci}: handle_client_input non-ok, state={:?}",
+                            client.state
+                        );
                         to_remove.push(ci);
                         continue;
                     }
@@ -593,30 +620,38 @@ fn server_mainloop(
             if client.state == ClientState::Replaying
                 && !continue_replay(client, exit_status, &mut exit_notified)
             {
+                eprintln!("[mn-srv] drop client {ci}: continue_replay false");
                 to_remove.push(ci);
                 continue;
             }
 
-            // Send PTY data to live clients (chunked to MAX_PAYLOAD)
+            // Send PTY data to live clients (chunked to MAX_PAYLOAD).
+            // We only read PTY when every live client has room, so
+            // queue_packet should always succeed here. If it ever
+            // doesn't (e.g. replay-driven backpressure raced us),
+            // log it and skip the chunk rather than dropping the
+            // client — the slow client will catch up next iter.
             if client.state == ClientState::Live
                 && let Some(ref data) = pty_data
             {
-                let mut dropped = false;
                 for chunk in data.chunks(protocol::MAX_PAYLOAD) {
                     let pkt = Packet::content(chunk);
                     if !client.queue_packet(&pkt) {
-                        to_remove.push(ci);
-                        dropped = true;
+                        eprintln!(
+                            "[mn-srv] client {ci}: outbound full mid-broadcast ({} bytes); skipping chunk",
+                            client.outbound.len()
+                        );
                         break;
                     }
-                }
-                if dropped {
-                    continue;
                 }
             }
 
             // Flush outbound
             if (rev.contains(PollFlags::OUT) || client.has_pending_output()) && !client.flush() {
+                eprintln!(
+                    "[mn-srv] drop client {ci}: flush() write error, outbound={}",
+                    client.outbound.len()
+                );
                 to_remove.push(ci);
                 continue;
             }
@@ -652,6 +687,7 @@ fn server_mainloop(
 
         // Server exit condition: child exited, no clients, at least one was notified
         if !child_running && clients.is_empty() && exit_notified {
+            eprintln!("[mn-srv] mainloop exit: child_gone+no_clients+notified");
             break;
         }
     }
@@ -893,6 +929,11 @@ fn handle_child_exit(
         }
         Err(_) => Some(1),
     };
+    eprintln!(
+        "[mn-srv] handle_child_exit: status={:?} n_clients={}",
+        exit_status,
+        clients.len()
+    );
 
     // Send Exit to all live clients
     let pkt = Packet::exit(exit_status.unwrap());
