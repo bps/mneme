@@ -449,6 +449,20 @@ fn server_mainloop(
 ) -> io::Result<()> {
     let mut ring = RingBuffer::new(ring_size);
     let mut clients: Vec<ServerClient> = Vec::new();
+    // Optional: dump every raw byte read from the PTY leader to a file.
+    // Set MNEME_PTY_LOG=/path/to/file.bin in the environment of the
+    // process that runs `mn new`/`mn create`. The file is appended to
+    // and is the exact byte stream the child wrote.
+    let mut pty_log = std::env::var("MNEME_PTY_LOG")
+        .ok()
+        .and_then(|p| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .ok()
+        });
+
     let mut child_running = true;
     let mut exit_status: Option<u32> = None;
     let mut exit_notified = false; // at least one client saw the exit
@@ -542,6 +556,10 @@ fn server_mainloop(
                 Ok(0) => {} // would block
                 Ok(n) => {
                     let data = read_buf[..n].to_vec();
+                    if let Some(ref mut f) = pty_log {
+                        use std::io::Write;
+                        let _ = f.write_all(&data);
+                    }
                     ring.write(&data);
                     pty_data = Some(data);
                 }

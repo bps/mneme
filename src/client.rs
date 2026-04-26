@@ -203,6 +203,17 @@ fn client_mainloop(
             .ok()
     });
 
+    // Debug: dump every raw byte the client writes to stdout if
+    // MNEME_STDOUT_LOG is set. The file is appended to and is the
+    // exact byte stream the host terminal received.
+    let mut stdout_log = std::env::var("MNEME_STDOUT_LOG").ok().and_then(|path| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+    });
+
     // Set up SIGWINCH self-pipe
     let (sig_read, sig_write) = {
         let (r, w) = rustix::pipe::pipe()?;
@@ -330,6 +341,10 @@ fn client_mainloop(
                 match pkt.msg_type {
                     MsgType::Replay | MsgType::Content => {
                         // Write to stdout
+                        if let Some(ref mut f) = stdout_log {
+                            use std::io::Write;
+                            let _ = f.write_all(&pkt.payload);
+                        }
                         let _ = protocol::write_all_fd(stdout.as_fd(), &pkt.payload);
                     }
                     MsgType::ReplayEnd => {
