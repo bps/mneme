@@ -333,54 +333,6 @@ pub fn recv_packet(fd: BorrowedFd<'_>) -> io::Result<Packet> {
 // ---------------------------------------------------------------------------
 // Non-blocking I/O helpers for the server event loop
 // ---------------------------------------------------------------------------
-
-/// Result of a non-blocking write attempt.
-pub enum WriteResult {
-    /// All bytes written.
-    Complete,
-    /// Partial write — `written` bytes consumed, rest must be buffered.
-    Partial(usize),
-    /// Would block — nothing written, buffer everything.
-    WouldBlock,
-    /// Peer gone or fatal error.
-    Error,
-}
-
-/// Attempt a non-blocking write. Does NOT retry on EAGAIN.
-pub fn try_write(fd: BorrowedFd<'_>, buf: &[u8]) -> WriteResult {
-    let mut written = 0;
-    while written < buf.len() {
-        match rustix::io::write(fd, &buf[written..]) {
-            Ok(0) => {
-                return WriteResult::Error;
-            }
-            Ok(n) => written += n,
-            Err(rustix::io::Errno::AGAIN) => {
-                if written > 0 {
-                    return WriteResult::Partial(written);
-                }
-                return WriteResult::WouldBlock;
-            }
-            Err(rustix::io::Errno::INTR) => continue,
-            Err(_) => return WriteResult::Error,
-        }
-    }
-    WriteResult::Complete
-}
-
-/// Read up to buf.len() bytes non-blocking. Returns number of bytes read,
-/// Ok(0) for would-block, Err for real errors/EOF.
-pub fn try_read(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<usize> {
-    match rustix::io::read(fd, buf) {
-        Ok(0) => Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
-        Ok(n) => Ok(n),
-        Err(rustix::io::Errno::AGAIN) => Ok(0),
-        Err(rustix::io::Errno::INTR) => Ok(0),
-        Err(e) => Err(e.into()),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

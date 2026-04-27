@@ -300,8 +300,10 @@ pub fn run_server(args: &[String]) -> Result<(), crate::Error> {
 
         // PTY leader must be non-blocking for AsyncFd.
         set_nonblocking(&leader_fd)?;
-        let leader = std::sync::Arc::new(AsyncFd::with_interest(leader_fd, Interest::READABLE | Interest::WRITABLE)
-            .map_err(|e| format!("AsyncFd PTY: {e}"))?);
+        let leader = std::sync::Arc::new(
+            AsyncFd::with_interest(leader_fd, Interest::READABLE | Interest::WRITABLE)
+                .map_err(|e| format!("AsyncFd PTY: {e}"))?,
+        );
 
         let listener = UnixListener::from_std(std_listener)?;
 
@@ -433,16 +435,19 @@ async fn mainloop(
     let mut child_running = true;
     let mut exit_status: Option<u32> = None;
     let mut exit_notified = false;
+    // On Linux, reading the PTY master after the slave has closed returns
+    // EIO (vs. macOS returning 0). Either way, once we've seen EOF we must
+    // stop polling the readable arm — otherwise AsyncFd keeps reporting
+    // ready and we busy-loop, starving child.wait() and listener.accept().
+    let mut pty_eof = false;
 
-    let mut pty_log = std::env::var("MNEME_PTY_LOG")
-        .ok()
-        .and_then(|p| {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(p)
-                .ok()
-        });
+    let mut pty_log = std::env::var("MNEME_PTY_LOG").ok().and_then(|p| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)
+            .ok()
+    });
 
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ControlMsg>();
     let pty_write_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
@@ -487,7 +492,10 @@ async fn mainloop(
             }
 
             // PTY readable ----------------------------------------------
-            guard = leader.readable(), if child_running => {
+            // Note: we keep polling even after `child_running` flips false,
+            // because data the child wrote just before exiting may still be
+            // sitting in the PTY master read buffer. We only stop on EIO/EOF.
+            guard = leader.readable(), if !pty_eof => {
                 let mut guard = match guard {
                     Ok(g) => g,
                     Err(_) => continue,
@@ -516,22 +524,29 @@ async fn mainloop(
                         for chunk in data.chunks(MAX_PAYLOAD) {
                             let pkt = Packet::content(chunk);
                             for c in &clients {
-                                if c.state == ClientState::Live {
-                                    if c.out_tx.send(OutMsg::Packet(pkt.clone())).await.is_err() {
-                                        // writer task gone; will be cleaned
-                                        // up via ClientGone shortly.
-                                    }
+                                if c.state == ClientState::Live
+                                    && c.out_tx.send(OutMsg::Packet(pkt.clone())).await.is_err()
+                                {
+                                    // writer task gone; will be cleaned
+                                    // up via ClientGone shortly.
                                 }
                             }
                         }
                     }
                     Ok(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => {}
                     Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                        // PTY closed — child exiting. Child::wait will catch up.
+                        // PTY closed (macOS reports read==0). Stop polling
+                        // and let child.wait() finish.
+                        pty_eof = true;
                     }
                     Ok(Err(e)) => {
-                        // EIO on macOS when child dies; ignore transient others.
-                        eprintln!("[mn-srv] pty read err: {e}");
+                        // Linux returns EIO on PTY master after the slave
+                        // closes. Treat as EOF so we don't busy-loop.
+                        if e.raw_os_error() == Some(libc::EIO) {
+                            pty_eof = true;
+                        } else {
+                            eprintln!("[mn-srv] pty read err: {e}");
+                        }
                     }
                     Err(_would_block) => { /* try_io returns Err if ready was spurious; loop */ }
                 }
@@ -759,7 +774,11 @@ async fn writer_task(
             }
         }
     }
-    if ok && write_pkt(&mut w, &Packet::empty(MsgType::ReplayEnd)).await.is_err() {
+    if ok
+        && write_pkt(&mut w, &Packet::empty(MsgType::ReplayEnd))
+            .await
+            .is_err()
+    {
         ok = false;
     }
     if !ok {

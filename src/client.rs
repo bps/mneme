@@ -17,7 +17,9 @@
 //! O_NONBLOCK on inherited stdio is restored in `NonblockGuard::drop` so
 //! the parent shell isn't left in nonblocking mode.
 
-use crate::protocol::{self, ClientFlags, HEADER_SIZE, Intent, MAX_PAYLOAD, MsgType, PROTOCOL_VERSION, Packet};
+use crate::protocol::{
+    self, ClientFlags, HEADER_SIZE, Intent, MAX_PAYLOAD, MsgType, PROTOCOL_VERSION, Packet,
+};
 
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
@@ -47,6 +49,7 @@ pub enum DisconnectReason {
     ServerRead(io::Error),
     ServerWrite(io::Error),
     ServerError(String),
+    #[allow(dead_code)] // referenced by tests
     InvalidExitPacket,
 }
 
@@ -124,12 +127,10 @@ pub fn attach(
         .enable_all()
         .build()?;
 
-    let result = rt.block_on(async move {
+    rt.block_on(async move {
         let stream = UnixStream::from_std(stream)?;
         client_mainloop(stream, detach_key, flags).await
-    });
-
-    result
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -261,10 +262,8 @@ async fn client_mainloop(
     // /dev/null and regular files can't be registered with kqueue; if
     // AsyncFd refuses, treat stdin as immediately at EOF so we just
     // wait for the server (e.g. to drive child exit through to the end).
-    let stdin_async =
-        AsyncFd::with_interest(StdioFd(stdin_fd), Interest::READABLE).ok();
-    let stdout_async =
-        AsyncFd::with_interest(StdioFd(stdout_fd), Interest::WRITABLE).ok();
+    let stdin_async = AsyncFd::with_interest(StdioFd(stdin_fd), Interest::READABLE).ok();
+    let stdout_async = AsyncFd::with_interest(StdioFd(stdout_fd), Interest::WRITABLE).ok();
 
     let stdin_is_tty = rustix::termios::isatty(unsafe { BorrowedFd::borrow_raw(stdin_fd) });
     let mut stdin_eof = stdin_async.is_none();
@@ -294,8 +293,7 @@ async fn client_mainloop(
     tokio::spawn(server_reader_task(read_half, server_evt_tx.clone()));
     tokio::spawn(server_writer_task(write_half, out_pkt_rx));
 
-    let mut sigwinch =
-        signal(SignalKind::window_change()).map_err(|e| format!("sigwinch: {e}"))?;
+    let mut sigwinch = signal(SignalKind::window_change()).map_err(|e| format!("sigwinch: {e}"))?;
 
     let mut in_replay = true;
     let mut stdin_buf = vec![0u8; 4096];
@@ -396,9 +394,9 @@ async fn client_mainloop(
                     Err(_) => continue,
                 };
 
-                if let Some(ref f) = debug_file.as_ref() {
+                if let Some(f) = debug_file.as_ref() {
                     use std::io::Write;
-                    let _ = writeln!(&**f, "stdin[{}]: {:02x?}", n, &stdin_buf[..n]);
+                    let _ = writeln!(&*f, "stdin[{}]: {:02x?}", n, &stdin_buf[..n]);
                 }
 
                 let detach_pos = find_detach_key(&stdin_buf[..n], detach_key, &csi_u_detach);
