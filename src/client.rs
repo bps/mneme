@@ -1,10 +1,36 @@
-use crate::protocol::{self, ClientFlags, Intent, MsgType, PROTOCOL_VERSION, Packet};
+//! Tokio-based attach client.
+//!
+//! Setup is synchronous (connect, exchange Hello/Welcome, enter raw mode);
+//! the bidirectional event loop runs on a current_thread runtime.
+//!
+//! Three tokio tasks (counting the main task itself):
+//!  - **Server reader task** owns the read half of the UnixStream, parses
+//!    packets, and forwards them to the main task via a `ServerEvent`
+//!    channel.
+//!  - **Server writer task** owns the write half and drains a `Vec<u8>`
+//!    mpsc — used by the main task to send Content/Resize/Detach packets
+//!    without serializing on a Mutex.
+//!  - **Main task** drives stdin (`AsyncFd<RawFd>`), SIGWINCH
+//!    (`tokio::signal::unix`), and reacts to ServerEvents (writing
+//!    Replay/Content payloads to stdout via another `AsyncFd<RawFd>`).
+//!
+//! O_NONBLOCK on inherited stdio is restored in `NonblockGuard::drop` so
+//! the parent shell isn't left in nonblocking mode.
 
-use rustix::event::{PollFd, PollFlags};
+use crate::protocol::{self, ClientFlags, HEADER_SIZE, Intent, MAX_PAYLOAD, MsgType, PROTOCOL_VERSION, Packet};
+
 use std::io;
-use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::net::UnixStream;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
+use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::Path;
+
+use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::mpsc;
 
 // ---------------------------------------------------------------------------
 // Attach result
@@ -37,7 +63,7 @@ impl std::fmt::Display for DisconnectReason {
 }
 
 // ---------------------------------------------------------------------------
-// Attach to a session
+// Public entry
 // ---------------------------------------------------------------------------
 
 pub fn attach(
@@ -48,10 +74,10 @@ pub fn attach(
     detach_key: u8,
     _quiet: bool,
 ) -> Result<AttachResult, crate::Error> {
-    let stream = UnixStream::connect(socket_path)?;
-    stream.set_nonblocking(false)?; // blocking for handshake
+    // Sync handshake -- blocking is fine and gives us crisp early errors.
+    let stream = StdUnixStream::connect(socket_path)?;
+    stream.set_nonblocking(false)?;
 
-    // Send Hello
     let hello = protocol::Hello {
         version: PROTOCOL_VERSION,
         intent: Intent::Attach,
@@ -61,7 +87,6 @@ pub fn attach(
     };
     protocol::send_packet(stream.as_fd(), &Packet::hello(&hello))?;
 
-    // Receive Welcome
     let pkt = protocol::recv_packet(stream.as_fd())?;
     match pkt.msg_type {
         MsgType::Welcome => {
@@ -83,20 +108,28 @@ pub fn attach(
         _ => return Err("unexpected response from server".into()),
     }
 
-    // Switch to non-blocking for the event loop
-    stream.set_nonblocking(true)?;
-
-    // Set terminal to raw mode (if stdin is a tty)
+    // Raw-mode termios guard before we go async.
     let _raw_guard = match RawTerminal::enter() {
-        Ok(guard) => Some(guard),
+        Ok(g) => Some(g),
         Err(e) => {
             eprintln!("mn: warning: could not set raw mode: {e}");
             None
         }
     };
 
-    // Run the client event loop
-    client_mainloop(stream, detach_key, flags)
+    // Switch socket to nonblocking for tokio.
+    stream.set_nonblocking(true)?;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    let result = rt.block_on(async move {
+        let stream = UnixStream::from_std(stream)?;
+        client_mainloop(stream, detach_key, flags).await
+    });
+
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -113,7 +146,6 @@ impl RawTerminal {
         let orig = rustix::termios::tcgetattr(&stdin)?;
         let mut raw = orig.clone();
 
-        // cfmakeraw equivalent
         raw.input_modes &= !(rustix::termios::InputModes::IGNBRK
             | rustix::termios::InputModes::BRKINT
             | rustix::termios::InputModes::PARMRK
@@ -132,44 +164,21 @@ impl RawTerminal {
         raw.control_modes |= rustix::termios::ControlModes::CS8;
         raw.control_modes &= !rustix::termios::ControlModes::PARENB;
 
-        // VMIN=1, VTIME=0
         raw.special_codes[rustix::termios::SpecialCodeIndex::VMIN] = 1;
         raw.special_codes[rustix::termios::SpecialCodeIndex::VTIME] = 0;
 
         rustix::termios::tcsetattr(&stdin, rustix::termios::OptionalActions::Now, &raw)?;
-
-        // Intentionally do NOT enter the alternate screen. The ring-buffer
-        // replay drives the outer terminal into whatever state the child
-        // is in (including altscreen, if a TUI is running), and we want
-        // pre-attach terminal content to remain in scrollback.
-
         Ok(Self { orig })
     }
 }
 
 impl Drop for RawTerminal {
     fn drop(&mut self) {
-        // Targeted soft reset: guarantee the outer terminal is left in a
-        // usable state regardless of where the child's output stream
-        // stopped (mid-SGR, mid-altscreen, mouse-reporting enabled, etc.).
-        // We deliberately avoid a full RIS (\ec), which would clear
-        // scrollback on some terminals.
-        //
-        //   \e[?1049l   exit altscreen if the child was in it (no-op otherwise)
-        //   \e[<u       pop kitty keyboard protocol
-        //   \e[0m       reset SGR
-        //   \e[?25h     show cursor
-        //   \e[?7h      autowrap on
-        //   \e[?2004l   bracketed paste off
-        //   \e[?1000l..1006l  mouse reporting off (normal, button, any, SGR)
-        //   \e[r        reset scroll region
-        //   \r\n        start the shell prompt on a fresh line
         let stdout = io::stdout();
         let _ = protocol::write_all_fd(
             stdout.as_fd(),
             b"\x1b[?1049l\x1b[<u\x1b[0m\x1b[?25h\x1b[?7h\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[r\r\n",
         );
-
         let stdin = io::stdin();
         let _ =
             rustix::termios::tcsetattr(&stdin, rustix::termios::OptionalActions::Flush, &self.orig);
@@ -177,24 +186,89 @@ impl Drop for RawTerminal {
 }
 
 // ---------------------------------------------------------------------------
-// Client event loop
+// O_NONBLOCK guard for inherited stdio.
+//
+// Setting NONBLOCK on a dup'd inherited descriptor affects the underlying
+// open file description, so the parent shell can be left in nonblocking
+// mode if we don't restore. We save the original flags here and restore
+// them in Drop (alongside RawTerminal).
 // ---------------------------------------------------------------------------
 
-fn set_fd_nonblocking(fd: &OwnedFd) -> io::Result<()> {
-    let flags = rustix::fs::fcntl_getfl(fd)?;
-    rustix::fs::fcntl_setfl(fd, flags | rustix::fs::OFlags::NONBLOCK)?;
-    Ok(())
+struct NonblockGuard {
+    fd: RawFd,
+    orig: rustix::fs::OFlags,
 }
 
-fn client_mainloop(
+impl NonblockGuard {
+    fn set(fd: RawFd) -> io::Result<Self> {
+        let bfd = unsafe { BorrowedFd::borrow_raw(fd) };
+        let orig = rustix::fs::fcntl_getfl(bfd)?;
+        rustix::fs::fcntl_setfl(bfd, orig | rustix::fs::OFlags::NONBLOCK)?;
+        Ok(Self { fd, orig })
+    }
+}
+
+impl Drop for NonblockGuard {
+    fn drop(&mut self) {
+        let bfd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+        let _ = rustix::fs::fcntl_setfl(bfd, self.orig);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AsyncFd over a raw stdio fd (we don't own it — never close on drop).
+// ---------------------------------------------------------------------------
+
+struct StdioFd(RawFd);
+
+impl AsRawFd for StdioFd {
+    fn as_raw_fd(&self) -> RawFd {
+        self.0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Server events
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+enum ServerEvent {
+    /// Bytes to write to local stdout (Replay or Content payload).
+    Output(Vec<u8>),
+    ReplayEnd,
+    ResizeReq,
+    Exit(u32),
+    Error(String),
+    HungUp,
+    ReadFailed(io::Error),
+}
+
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
+
+async fn client_mainloop(
     stream: UnixStream,
     detach_key: u8,
     flags: ClientFlags,
 ) -> Result<AttachResult, crate::Error> {
-    let stdin = io::stdin();
-    let stdout = io::stdout();
+    let stdin_fd = io::stdin().as_raw_fd();
+    let stdout_fd = io::stdout().as_raw_fd();
 
-    // Debug: log stdin bytes to a file if MNEME_DEBUG is set
+    let _stdin_nb = NonblockGuard::set(stdin_fd).ok();
+    let _stdout_nb = NonblockGuard::set(stdout_fd).ok();
+
+    // /dev/null and regular files can't be registered with kqueue; if
+    // AsyncFd refuses, treat stdin as immediately at EOF so we just
+    // wait for the server (e.g. to drive child exit through to the end).
+    let stdin_async =
+        AsyncFd::with_interest(StdioFd(stdin_fd), Interest::READABLE).ok();
+    let stdout_async =
+        AsyncFd::with_interest(StdioFd(stdout_fd), Interest::WRITABLE).ok();
+
+    let stdin_is_tty = rustix::termios::isatty(unsafe { BorrowedFd::borrow_raw(stdin_fd) });
+    let mut stdin_eof = stdin_async.is_none();
+
     let debug_file = std::env::var("MNEME_DEBUG").ok().and_then(|path| {
         std::fs::OpenOptions::new()
             .create(true)
@@ -202,11 +276,7 @@ fn client_mainloop(
             .open(path)
             .ok()
     });
-
-    // Debug: dump every raw byte the client writes to stdout if
-    // MNEME_STDOUT_LOG is set. The file is appended to and is the
-    // exact byte stream the host terminal received.
-    let mut stdout_log = std::env::var("MNEME_STDOUT_LOG").ok().and_then(|path| {
+    let stdout_log = std::env::var("MNEME_STDOUT_LOG").ok().and_then(|path| {
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -214,231 +284,258 @@ fn client_mainloop(
             .ok()
     });
 
-    // Set up SIGWINCH self-pipe
-    let (sig_read, sig_write) = {
-        let (r, w) = rustix::pipe::pipe()?;
-        set_fd_nonblocking(&r)?;
-        set_fd_nonblocking(&w)?;
-        (r, w)
-    };
-    signal_hook::low_level::pipe::register(signal_hook::consts::SIGWINCH, sig_write)?;
-
-    // Build the CSI u (kitty keyboard protocol) encoding of the detach key.
-    // When a TUI app enables this protocol, Ctrl-\ arrives as ESC[92;5u
-    // instead of byte 0x1C.
     let csi_u_detach = csi_u_press_sequence(detach_key);
 
-    let mut read_buf = [0u8; 4096];
-    let mut in_replay = true;
-    // If stdin isn't a TTY (e.g. piped /dev/null), don't treat its EOF
-    // as a detach intent — just stop polling it and wait for the server
-    // to close (e.g. on child exit).
-    let stdin_is_tty = rustix::termios::isatty(&stdin);
-    let mut stdin_eof = false;
+    // Split socket and spawn reader/writer tasks.
+    let (read_half, write_half) = stream.into_split();
+    let (server_evt_tx, mut server_evt_rx) = mpsc::unbounded_channel::<ServerEvent>();
+    let (out_pkt_tx, out_pkt_rx) = mpsc::channel::<Packet>(64);
 
-    // Accumulation buffer for partial packets from server
-    let mut server_buf: Vec<u8> = Vec::new();
+    tokio::spawn(server_reader_task(read_half, server_evt_tx.clone()));
+    tokio::spawn(server_writer_task(write_half, out_pkt_rx));
+
+    let mut sigwinch =
+        signal(SignalKind::window_change()).map_err(|e| format!("sigwinch: {e}"))?;
+
+    let mut in_replay = true;
+    let mut stdin_buf = vec![0u8; 4096];
+
+    let mut stdout_log = stdout_log;
+    let debug_file = debug_file;
 
     loop {
-        let stdin_flags = if stdin_eof {
-            PollFlags::empty()
-        } else {
-            PollFlags::IN
-        };
-        let mut pollfds: Vec<PollFd<'_>> = vec![
-            PollFd::new(&stdin, stdin_flags),
-            PollFd::new(&stream, PollFlags::IN),
-            PollFd::new(&sig_read, PollFlags::IN),
-        ];
+        // Stdin handling depends on whether replay is over and whether we've EOF'd.
+        let stdin_active = !in_replay && !stdin_eof;
 
-        match rustix::event::poll(&mut pollfds, None) {
-            Ok(_) => {}
-            Err(rustix::io::Errno::INTR) => continue,
-            Err(e) => return Err(e.into()),
-        }
+        tokio::select! {
+            biased;
 
-        // SIGWINCH
-        if pollfds[2].revents().contains(PollFlags::IN) {
-            // Drain signal pipe
-            let mut sig_buf = [0u8; 64];
-            let _ = rustix::io::read(&sig_read, &mut sig_buf);
-
-            if !in_replay && let Err(e) = send_resize(&stream) {
-                return Ok(AttachResult::IoError(DisconnectReason::ServerWrite(e)));
-            }
-        }
-
-        // Keyboard input — check FIRST so detach key is never starved
-        // by server output
-        if pollfds[0].revents().contains(PollFlags::IN) && !in_replay {
-            let n = match protocol::try_read(stdin.as_fd(), &mut read_buf) {
-                Ok(0) => 0, // would block
-                Ok(n) => n,
-                Err(_) => {
-                    if stdin_is_tty {
-                        return Ok(AttachResult::Detached); // stdin closed
-                    } else {
-                        // Non-TTY stdin (e.g. /dev/null) — don't treat
-                        // EOF as a user detach. Stop polling stdin and
-                        // wait for the server to drive the rest.
-                        stdin_eof = true;
-                        0
-                    }
-                }
-            };
-
-            if n > 0 {
-                // Debug log
-                if let Some(ref mut f) = debug_file.as_ref() {
-                    use std::io::Write;
-                    let _ = writeln!(f, "stdin[{}]: {:02x?}", n, &read_buf[..n]);
-                }
-
-                // Check for detach key: raw byte or CSI u encoded
-                let detach_pos = find_detach_key(&read_buf[..n], detach_key, &csi_u_detach);
-                if let Some((pos, _len)) = detach_pos {
-                    // Send any bytes before the detach key
-                    if pos > 0 && !flags.contains(ClientFlags::READONLY) {
-                        for chunk in read_buf[..pos].chunks(protocol::MAX_PAYLOAD) {
-                            let pkt = Packet::content(chunk);
-                            let _ = protocol::send_packet(stream.as_fd(), &pkt);
+            // Server events ----------------------------------------------------
+            evt = server_evt_rx.recv() => {
+                let evt = match evt {
+                    Some(e) => e,
+                    None => return Ok(AttachResult::IoError(DisconnectReason::ServerHungUp)),
+                };
+                match evt {
+                    ServerEvent::Output(bytes) => {
+                        if let Some(ref mut f) = stdout_log {
+                            use std::io::Write;
+                            let _ = f.write_all(&bytes);
+                        }
+                        let res = match stdout_async.as_ref() {
+                            Some(a) => write_async(a, &bytes).await,
+                            None => {
+                                let bfd = unsafe { BorrowedFd::borrow_raw(stdout_fd) };
+                                protocol::write_all_fd(bfd, &bytes)
+                            }
+                        };
+                        if let Err(e) = res {
+                            return Ok(AttachResult::IoError(DisconnectReason::ServerWrite(e)));
                         }
                     }
-                    let pkt = Packet::empty(MsgType::Detach);
-                    let _ = protocol::send_packet(stream.as_fd(), &pkt);
+                    ServerEvent::ReplayEnd => {
+                        in_replay = false;
+                        if let Err(e) = send_resize(&out_pkt_tx).await {
+                            return Ok(AttachResult::IoError(DisconnectReason::ServerWrite(e)));
+                        }
+                    }
+                    ServerEvent::ResizeReq => {
+                        if let Err(e) = send_resize(&out_pkt_tx).await {
+                            return Ok(AttachResult::IoError(DisconnectReason::ServerWrite(e)));
+                        }
+                    }
+                    ServerEvent::Exit(status) => return Ok(AttachResult::Exited(status)),
+                    ServerEvent::Error(msg) => {
+                        return Ok(AttachResult::IoError(DisconnectReason::ServerError(msg)))
+                    }
+                    ServerEvent::HungUp => {
+                        return Ok(AttachResult::IoError(DisconnectReason::ServerHungUp))
+                    }
+                    ServerEvent::ReadFailed(e) => {
+                        return Ok(AttachResult::IoError(DisconnectReason::ServerRead(e)))
+                    }
+                }
+            }
+
+            // SIGWINCH ---------------------------------------------------------
+            _ = sigwinch.recv(), if !in_replay => {
+                if let Err(e) = send_resize(&out_pkt_tx).await {
+                    return Ok(AttachResult::IoError(DisconnectReason::ServerWrite(e)));
+                }
+            }
+
+            // Stdin readable ---------------------------------------------------
+            res = async {
+                match stdin_async.as_ref() {
+                    Some(a) => a.readable().await.map(Some),
+                    None => std::future::pending().await,
+                }
+            }, if stdin_active => {
+                let mut guard = match res {
+                    Ok(Some(g)) => g,
+                    _ => continue,
+                };
+                let n = match guard.try_io(|inner| {
+                    let fd = unsafe { BorrowedFd::borrow_raw(inner.get_ref().as_raw_fd()) };
+                    match rustix::io::read(fd, &mut stdin_buf) {
+                        Ok(0) => Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+                        Ok(n) => Ok(n),
+                        Err(rustix::io::Errno::AGAIN) => Err(io::ErrorKind::WouldBlock.into()),
+                        Err(e) => Err(io::Error::from(e)),
+                    }
+                }) {
+                    Ok(Ok(n)) => n,
+                    Ok(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                    Ok(Err(_)) => {
+                        if stdin_is_tty {
+                            return Ok(AttachResult::Detached);
+                        }
+                        stdin_eof = true;
+                        continue;
+                    }
+                    Err(_) => continue,
+                };
+
+                if let Some(ref f) = debug_file.as_ref() {
+                    use std::io::Write;
+                    let _ = writeln!(&**f, "stdin[{}]: {:02x?}", n, &stdin_buf[..n]);
+                }
+
+                let detach_pos = find_detach_key(&stdin_buf[..n], detach_key, &csi_u_detach);
+                if let Some((pos, _len)) = detach_pos {
+                    if pos > 0 && !flags.contains(ClientFlags::READONLY) {
+                        for chunk in stdin_buf[..pos].chunks(MAX_PAYLOAD) {
+                            let _ = out_pkt_tx.send(Packet::content(chunk)).await;
+                        }
+                    }
+                    let _ = out_pkt_tx.send(Packet::empty(MsgType::Detach)).await;
                     return Ok(AttachResult::Detached);
                 }
 
-                // Send to server (if not readonly), chunked to MAX_PAYLOAD
                 if !flags.contains(ClientFlags::READONLY) {
-                    for chunk in read_buf[..n].chunks(protocol::MAX_PAYLOAD) {
-                        let pkt = Packet::content(chunk);
-                        if let Err(e) = protocol::send_packet(stream.as_fd(), &pkt) {
-                            return Ok(AttachResult::IoError(DisconnectReason::ServerWrite(e)));
+                    for chunk in stdin_buf[..n].chunks(MAX_PAYLOAD) {
+                        if out_pkt_tx.send(Packet::content(chunk)).await.is_err() {
+                            return Ok(AttachResult::IoError(DisconnectReason::ServerHungUp));
                         }
                     }
                 }
             }
-        }
-
-        // Data from server
-        if pollfds[1]
-            .revents()
-            .intersects(PollFlags::IN | PollFlags::HUP)
-        {
-            let n = match protocol::try_read(stream.as_fd(), &mut read_buf) {
-                Ok(0) => continue, // would block
-                Ok(n) => n,
-                Err(e) => return Ok(AttachResult::IoError(DisconnectReason::ServerRead(e))),
-            };
-
-            server_buf.extend_from_slice(&read_buf[..n]);
-
-            // Process complete packets from the buffer
-            while let Some((pkt, consumed)) = try_parse_packet(&server_buf) {
-                server_buf.drain(..consumed);
-
-                match pkt.msg_type {
-                    MsgType::Replay | MsgType::Content => {
-                        // Write to stdout
-                        if let Some(ref mut f) = stdout_log {
-                            use std::io::Write;
-                            let _ = f.write_all(&pkt.payload);
-                        }
-                        let _ = protocol::write_all_fd(stdout.as_fd(), &pkt.payload);
-                    }
-                    MsgType::ReplayEnd => {
-                        in_replay = false;
-                        // Send resize now that we're live
-                        if let Err(e) = send_resize(&stream) {
-                            return Ok(AttachResult::IoError(DisconnectReason::ServerWrite(e)));
-                        }
-                    }
-                    MsgType::ResizeReq => {
-                        if let Err(e) = send_resize(&stream) {
-                            return Ok(AttachResult::IoError(DisconnectReason::ServerWrite(e)));
-                        }
-                    }
-                    MsgType::Exit => {
-                        if let Some(status) = pkt.parse_exit_status() {
-                            return Ok(AttachResult::Exited(status));
-                        }
-                        return Ok(AttachResult::IoError(DisconnectReason::InvalidExitPacket));
-                    }
-                    MsgType::Error => {
-                        let msg = pkt
-                            .parse_error()
-                            .unwrap_or_else(|| "unknown server error".into());
-                        return Ok(AttachResult::IoError(DisconnectReason::ServerError(msg)));
-                    }
-                    _ => {} // ignore unexpected
-                }
-            }
-        }
-
-        // Server disconnected
-        if pollfds[1].revents().contains(PollFlags::HUP)
-            && !pollfds[1].revents().contains(PollFlags::IN)
-        {
-            return Ok(AttachResult::IoError(DisconnectReason::ServerHungUp));
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Tasks
+// ---------------------------------------------------------------------------
+
+async fn server_reader_task(mut r: OwnedReadHalf, tx: mpsc::UnboundedSender<ServerEvent>) {
+    loop {
+        let pkt = match recv_packet_half(&mut r).await {
+            Ok(p) => p,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                let _ = tx.send(ServerEvent::HungUp);
+                return;
+            }
+            Err(e) => {
+                let _ = tx.send(ServerEvent::ReadFailed(e));
+                return;
+            }
+        };
+        let evt = match pkt.msg_type {
+            MsgType::Replay | MsgType::Content => ServerEvent::Output(pkt.payload),
+            MsgType::ReplayEnd => ServerEvent::ReplayEnd,
+            MsgType::ResizeReq => ServerEvent::ResizeReq,
+            MsgType::Exit => match pkt.parse_exit_status() {
+                Some(s) => ServerEvent::Exit(s),
+                None => ServerEvent::Error("invalid exit packet".into()),
+            },
+            MsgType::Error => {
+                ServerEvent::Error(pkt.parse_error().unwrap_or_else(|| "unknown".into()))
+            }
+            _ => continue,
+        };
+        if tx.send(evt).is_err() {
+            return;
+        }
+    }
+}
+
+async fn server_writer_task(mut w: OwnedWriteHalf, mut rx: mpsc::Receiver<Packet>) {
+    while let Some(pkt) = rx.recv().await {
+        let buf = pkt.encode();
+        if w.write_all(&buf).await.is_err() {
+            return;
+        }
+    }
+    let _ = w.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn send_resize(stream: &UnixStream) -> io::Result<()> {
+async fn send_resize(tx: &mpsc::Sender<Packet>) -> io::Result<()> {
     let (rows, cols) = crate::get_terminal_size();
-    let pkt = Packet::resize(rows, cols);
-    protocol::send_packet(stream.as_fd(), &pkt).map_err(io::Error::other)
+    tx.send(Packet::resize(rows, cols))
+        .await
+        .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))
 }
 
-/// Try to parse a complete packet from the front of a byte buffer.
-/// Returns (packet, bytes_consumed) or None if not enough data.
-fn try_parse_packet(buf: &[u8]) -> Option<(Packet, usize)> {
-    if buf.len() < protocol::HEADER_SIZE {
-        return None;
+async fn write_async(out: &AsyncFd<StdioFd>, mut buf: &[u8]) -> io::Result<()> {
+    while !buf.is_empty() {
+        let mut guard = out.writable().await?;
+        match guard.try_io(|inner| {
+            let fd = unsafe { BorrowedFd::borrow_raw(inner.get_ref().as_raw_fd()) };
+            match rustix::io::write(fd, buf) {
+                Ok(0) => Err(io::Error::from(io::ErrorKind::WriteZero)),
+                Ok(n) => Ok(n),
+                Err(rustix::io::Errno::AGAIN) => Err(io::ErrorKind::WouldBlock.into()),
+                Err(e) => Err(io::Error::from(e)),
+            }
+        }) {
+            Ok(Ok(n)) => buf = &buf[n..],
+            Ok(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => continue,
+        }
     }
-    let msg_type = protocol::MsgType::from_u8(buf[0])?;
-    let len = u16::from_le_bytes([buf[1], buf[2]]) as usize;
-    if len > protocol::MAX_PAYLOAD {
-        return None;
+    Ok(())
+}
+
+async fn recv_packet_half(r: &mut OwnedReadHalf) -> io::Result<Packet> {
+    let mut header = [0u8; HEADER_SIZE];
+    r.read_exact(&mut header).await?;
+    let msg_type = MsgType::from_u8(header[0])
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown message type"))?;
+    let len = u16::from_le_bytes([header[1], header[2]]) as usize;
+    if len > MAX_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "payload too large",
+        ));
     }
-    let total = protocol::HEADER_SIZE + len;
-    if buf.len() < total {
-        return None;
+    let mut payload = vec![0u8; len];
+    if len > 0 {
+        r.read_exact(&mut payload).await?;
     }
-    let payload = buf[protocol::HEADER_SIZE..total].to_vec();
-    Some((Packet::new(msg_type, payload), total))
+    Ok(Packet::new(msg_type, payload))
 }
 
 /// Build the CSI u (kitty keyboard protocol) encoding for a Ctrl-key press.
-/// E.g., Ctrl-\ (0x1C) → ESC[92;5u (backslash codepoint=92, Ctrl modifier=5).
 fn csi_u_press_sequence(detach_key: u8) -> Vec<u8> {
     if detach_key >= 0x20 {
-        return Vec::new(); // not a control character
+        return Vec::new();
     }
-    // Control character 0x01..0x1F corresponds to Ctrl + (key | 0x40)
-    // e.g., 0x1C (Ctrl-\) → base char = 0x5C = 92 decimal
     let base_codepoint = (detach_key as u32) | 0x40;
-    // CSI u format: ESC [ <codepoint> ; <modifiers> u
-    // Ctrl modifier = 5 (modifier bits + 1, where Ctrl = bit 2 = 4, +1 = 5)
     format!("\x1b[{base_codepoint};5u").into_bytes()
 }
 
-/// Find the detach key in a byte buffer, checking both raw byte and
-/// CSI u (kitty keyboard protocol) encoding.
-/// Returns Some((position, length)) or None.
 fn find_detach_key(buf: &[u8], raw_key: u8, csi_u: &[u8]) -> Option<(usize, usize)> {
-    // Check CSI u first (longer match takes priority to avoid partial matches)
     if !csi_u.is_empty()
         && let Some(pos) = buf.windows(csi_u.len()).position(|w| w == csi_u)
     {
         return Some((pos, csi_u.len()));
     }
-    // Check raw byte
     if let Some(pos) = buf.iter().position(|&b| b == raw_key) {
         return Some((pos, 1));
     }

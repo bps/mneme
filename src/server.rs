@@ -1,33 +1,67 @@
-use crate::protocol::{self, ClientFlags, Intent, MsgType, PROTOCOL_VERSION, Packet};
+//! Tokio-based session server.
+//!
+//! Architecture (one runtime per `mn --server` process, current_thread flavor):
+//!
+//!  - **Main task** (`mainloop`) owns:
+//!      * the ring buffer
+//!      * the PTY master (`AsyncFd<OwnedFd>`)
+//!      * the listening Unix socket
+//!      * the child process handle (`tokio::process::Child`)
+//!      * a `Vec<ClientHandle>` describing each registered client
+//!      * the receive end of an unbounded control mpsc that intake / reader /
+//!        writer tasks send events on.
+//!
+//!  - **Intake task** (one per accepted connection): reads the `Hello`
+//!    packet, validates protocol version + peer UID, sends `Welcome`.
+//!    On `Query` intent, exits. On `Attach`, forwards
+//!    `ControlMsg::Register{stream, hello}` to the main task.
+//!
+//!  - **Per-client writer task**: owns the write half of the socket and a
+//!    bounded `mpsc::Receiver<OutMsg>`. On startup it sends the ring
+//!    snapshot as `Replay` chunks + `ReplayEnd`, signals
+//!    `ControlMsg::ClientLive{id}`, then drains the channel forever.
+//!
+//!  - **Per-client reader task**: owns the read half. Parses packets and
+//!    forwards them as `ControlMsg::Input/Resize/Detach{id, ...}`. On
+//!    EOF or error, sends `ControlMsg::ClientGone{id}`.
+//!
+//! Backpressure: PTY fan-out only sends to *Live* clients. The bounded
+//! per-client outbound channel means a slow client makes the main task
+//! `await` on `send`, which stalls the PTY read loop and ultimately the
+//! child — same semantics as the original poll-based server.
+
+use crate::protocol::{
+    self, ClientFlags, HEADER_SIZE, Hello, Intent, MAX_PAYLOAD, MsgType, PROTOCOL_VERSION, Packet,
+};
 use crate::ring::RingBuffer;
 
-use rustix::event::{PollFd, PollFlags};
-use std::collections::VecDeque;
 use std::io;
 #[cfg(target_os = "macos")]
 use std::os::fd::AsRawFd;
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
-use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
+use std::time::Duration;
+
+use tokio::io::unix::AsyncFd;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
+use tokio::net::UnixListener;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::sync::mpsc;
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
-const OUTBOUND_LIMIT: usize = 256 * 1024; // 256 KiB per client
+/// Capacity of each client's outbound channel, in packets. Each `Content`
+/// packet is at most `HEADER_SIZE + MAX_PAYLOAD` ≈ 4 KiB. 64 packets ≈
+/// 256 KiB — matches the original byte-budget per client.
+const OUTBOUND_CAP: usize = 64;
 const READ_BUF_SIZE: usize = 4096;
+const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // Platform helpers
 // ---------------------------------------------------------------------------
-
-/// Create a pipe with both ends set to non-blocking.
-fn pipe_nonblock() -> io::Result<(OwnedFd, OwnedFd)> {
-    let (r, w) = rustix::pipe::pipe()?;
-    set_nonblocking(&r)?;
-    set_nonblocking(&w)?;
-    Ok((r, w))
-}
 
 fn set_nonblocking(fd: &OwnedFd) -> io::Result<()> {
     let flags = rustix::fs::fcntl_getfl(fd)?;
@@ -54,14 +88,12 @@ fn open_pty() -> io::Result<(OwnedFd, OwnedFd)> {
     unsafe { Ok((OwnedFd::from_raw_fd(leader), OwnedFd::from_raw_fd(follower))) }
 }
 
-/// Check that the peer on the other end of a Unix socket is the same UID as us.
-/// Returns Ok(()) if the peer matches, Err if not or if the check fails.
 #[cfg(target_os = "macos")]
-fn verify_peer_uid(fd: &OwnedFd) -> io::Result<()> {
+fn verify_peer_uid_std(stream: &std::os::unix::net::UnixStream) -> io::Result<()> {
     let my_uid = rustix::process::getuid().as_raw();
     let mut peer_uid: libc::uid_t = 0;
     let mut peer_gid: libc::gid_t = 0;
-    let ret = unsafe { libc::getpeereid(fd.as_raw_fd(), &mut peer_uid, &mut peer_gid) };
+    let ret = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut peer_uid, &mut peer_gid) };
     if ret != 0 {
         return Err(io::Error::last_os_error());
     }
@@ -75,9 +107,10 @@ fn verify_peer_uid(fd: &OwnedFd) -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn verify_peer_uid(fd: &OwnedFd) -> io::Result<()> {
+fn verify_peer_uid_std(stream: &std::os::unix::net::UnixStream) -> io::Result<()> {
+    use std::os::fd::AsFd;
     let my_uid = rustix::process::getuid().as_raw();
-    let cred = rustix::net::sockopt::socket_peercred(fd)?;
+    let cred = rustix::net::sockopt::socket_peercred(stream.as_fd())?;
     let peer_uid = cred.uid.as_raw();
     if peer_uid != my_uid {
         return Err(io::Error::new(
@@ -89,87 +122,8 @@ fn verify_peer_uid(fd: &OwnedFd) -> io::Result<()> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn verify_peer_uid(_fd: &OwnedFd) -> io::Result<()> {
-    // No peer credential check available on this platform
+fn verify_peer_uid_std(_stream: &std::os::unix::net::UnixStream) -> io::Result<()> {
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Client state on the server side
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ClientState {
-    Connected, // Hello not yet received
-    Replaying, // Sending replay data
-    Live,      // Bidirectional
-}
-
-struct ServerClient {
-    fd: OwnedFd,
-    state: ClientState,
-    flags: ClientFlags,
-    outbound: VecDeque<u8>,
-    replay_buf: Option<Vec<u8>>, // snapshot being sent
-    replay_pos: usize,           // position in replay_buf
-    is_controller: bool,
-}
-
-impl ServerClient {
-    fn new(fd: OwnedFd) -> Self {
-        Self {
-            fd,
-            state: ClientState::Connected,
-            flags: ClientFlags::empty(),
-            outbound: VecDeque::new(),
-            replay_buf: None,
-            replay_pos: 0,
-            is_controller: false,
-        }
-    }
-
-    /// Queue a packet for sending. Returns false if the outbound buffer
-    /// is full (client should be disconnected).
-    fn queue_packet(&mut self, pkt: &Packet) -> bool {
-        let encoded = pkt.encode();
-        if self.outbound.len() + encoded.len() > OUTBOUND_LIMIT {
-            return false; // slow client
-        }
-        self.outbound.extend(encoded.iter());
-        true
-    }
-
-    /// Returns true if `extra` more bytes would fit in outbound without
-    /// exceeding the per-client limit. Used by the replay path to apply
-    /// backpressure instead of dropping the client.
-    fn outbound_has_room(&self, extra: usize) -> bool {
-        self.outbound.len() + extra <= OUTBOUND_LIMIT
-    }
-
-    /// Try to flush the outbound buffer. Returns false on fatal error.
-    fn flush(&mut self) -> bool {
-        while !self.outbound.is_empty() {
-            let (front, back) = self.outbound.as_slices();
-            let buf = if !front.is_empty() { front } else { back };
-            match protocol::try_write(self.fd.as_fd(), buf) {
-                protocol::WriteResult::Complete => {
-                    let len = buf.len();
-                    self.outbound.drain(..len);
-                }
-                protocol::WriteResult::Partial(n) => {
-                    self.outbound.drain(..n);
-                    return true; // can't write more right now
-                }
-                protocol::WriteResult::WouldBlock => return true,
-                protocol::WriteResult::Error => return false,
-            }
-        }
-        true
-    }
-
-    fn has_pending_output(&self) -> bool {
-        !self.outbound.is_empty() || self.replay_buf.is_some()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -211,9 +165,7 @@ fn parse_server_args(args: &[String]) -> io::Result<ServerOpts> {
             continue;
         }
         match args[i].as_str() {
-            "--" => {
-                past_separator = true;
-            }
+            "--" => past_separator = true,
             "--ready-fd" => {
                 i += 1;
                 ready_fd = Some(
@@ -254,9 +206,7 @@ fn parse_server_args(args: &[String]) -> io::Result<ServerOpts> {
                         .ok_or_else(|| arg_err("--socket-path requires a value"))?,
                 ));
             }
-            other => {
-                return Err(arg_err(format!("unknown server option: {other}")));
-            }
+            other => return Err(arg_err(format!("unknown server option: {other}"))),
         }
         i += 1;
     }
@@ -272,7 +222,7 @@ fn parse_server_args(args: &[String]) -> io::Result<ServerOpts> {
 }
 
 // ---------------------------------------------------------------------------
-// Server entry point
+// Server entry point — sync setup, then spin up tokio runtime
 // ---------------------------------------------------------------------------
 
 pub fn run_server(args: &[String]) -> Result<(), crate::Error> {
@@ -283,35 +233,24 @@ pub fn run_server(args: &[String]) -> Result<(), crate::Error> {
         opts.socket_path.file_name().unwrap_or_default(),
         opts.command
     );
-    // Best-effort: also catch panics so we know the server died via panic
-    // even if the log was discarded (Rust's panic message normally goes
-    // to stderr; this just gives us a final breadcrumb with the location).
+
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         eprintln!("[mn-srv] PANIC: {info}");
         default_hook(info);
     }));
 
-    // Take ownership of the ready fd and set CLOEXEC so the child doesn't inherit it
     let ready_fd = unsafe { OwnedFd::from_raw_fd(opts.ready_fd) };
     rustix::io::fcntl_setfd(&ready_fd, rustix::io::FdFlags::CLOEXEC)?;
 
-    // Fully detach from the calling session.
-    // Note: setsid() may fail if we're already a process group leader
-    // (which happens with process_group(0)). That's OK — the important
-    // thing is that stdio is /dev/null and we're in a new process group.
+    // Detach from controlling terminal. setsid may fail if we're already a
+    // process group leader — that's fine.
     let _ = rustix::process::setsid();
-
-    // Ignore SIGHUP as defense in depth
     unsafe {
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
     }
 
-    // Acquire the session lock BEFORE binding. The lock file lives next
-    // to the socket and is flocked for this process's lifetime. The
-    // kernel releases it on any form of process death, which is how we
-    // detect stale sessions. We hold `_lock_fd` in scope until the end
-    // of the function.
+    // Acquire the session lock BEFORE binding — kernel releases on death.
     let lock_path = opts.socket_path.with_file_name(format!(
         "{}.lock",
         opts.socket_path
@@ -330,15 +269,13 @@ pub fn run_server(args: &[String]) -> Result<(), crate::Error> {
         }
     };
 
-    // Bind + listen BEFORE spawning child — fail early
-    let listener = bind_listen(&opts.socket_path)
+    // Bind + listen BEFORE spawning the child — fail early.
+    let std_listener = bind_listen(&opts.socket_path)
         .map_err(|e| format!("bind {}: {e}", opts.socket_path.display()))?;
-    listener.set_nonblocking(true)?;
+    std_listener.set_nonblocking(true)?;
 
-    // Open PTY
+    // Open PTY and set initial size.
     let (leader_fd, follower_fd) = open_pty().map_err(|e| format!("openpty: {e}"))?;
-
-    // Set initial terminal size on the PTY
     let winsize = rustix::termios::Winsize {
         ws_row: opts.rows,
         ws_col: opts.cols,
@@ -347,32 +284,41 @@ pub fn run_server(args: &[String]) -> Result<(), crate::Error> {
     };
     let _ = rustix::termios::tcsetwinsize(&leader_fd, winsize);
 
-    // Spawn child
-    let child = spawn_child(&opts.command, follower_fd)
-        .map_err(|e| format!("spawn {:?}: {e}", opts.command))?;
-    let child_pid = child.id();
+    // Build the runtime. Current-thread: low overhead, no Send bounds.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
 
-    // Signal readiness to the CLI by closing the ready fd
-    drop(ready_fd);
+    rt.block_on(async move {
+        // Spawn the child *inside* the runtime so tokio can wire SIGCHLD.
+        let mut child = spawn_child(&opts.command, follower_fd)
+            .map_err(|e| format!("spawn {:?}: {e}", opts.command))?;
+        let child_pid = child.id().unwrap_or(0);
 
-    // Set leader_fd to non-blocking
-    set_nonblocking(&leader_fd)?;
+        // Signal readiness to the CLI by closing the pipe.
+        drop(ready_fd);
 
-    // Run the event loop
-    server_mainloop(
-        listener,
-        leader_fd,
-        child,
-        child_pid,
-        opts.ring_size,
-        &opts.socket_path,
-    )?;
+        // PTY leader must be non-blocking for AsyncFd.
+        set_nonblocking(&leader_fd)?;
+        let leader = std::sync::Arc::new(AsyncFd::with_interest(leader_fd, Interest::READABLE | Interest::WRITABLE)
+            .map_err(|e| format!("AsyncFd PTY: {e}"))?);
 
-    // Cleanup
+        let listener = UnixListener::from_std(std_listener)?;
+
+        let result = mainloop(listener, leader, &mut child, child_pid, opts.ring_size).await;
+
+        // Make sure the child is reaped before we exit.
+        if let Ok(None) = child.try_wait() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+
+        result
+    })?;
+
     let _ = std::fs::remove_file(&opts.socket_path);
     let _ = std::fs::remove_file(&lock_path);
     eprintln!("[mn-srv] exit clean");
-    // _lock_fd drops here, releasing the flock (though the file is already gone)
     Ok(())
 }
 
@@ -380,28 +326,22 @@ pub fn run_server(args: &[String]) -> Result<(), crate::Error> {
 // Socket binding
 // ---------------------------------------------------------------------------
 
-fn bind_listen(path: &std::path::Path) -> io::Result<UnixListener> {
-    // Remove stale socket if present
+fn bind_listen(path: &std::path::Path) -> io::Result<std::os::unix::net::UnixListener> {
     if path.exists() {
         std::fs::remove_file(path)?;
     }
-
-    let listener = UnixListener::bind(path)?;
-
-    // Set socket permissions to 0600
+    let listener = std::os::unix::net::UnixListener::bind(path)?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-
     Ok(listener)
 }
 
 // ---------------------------------------------------------------------------
-// Child spawning
+// Child spawning (tokio::process::Command)
 // ---------------------------------------------------------------------------
 
-fn spawn_child(command: &[String], follower_fd: OwnedFd) -> io::Result<std::process::Child> {
-    use std::os::unix::process::CommandExt;
-    use std::process::{Command, Stdio};
+fn spawn_child(command: &[String], follower_fd: OwnedFd) -> io::Result<tokio::process::Child> {
+    use std::process::Stdio;
 
     let (cmd, args) = if command.is_empty() {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
@@ -413,18 +353,19 @@ fn spawn_child(command: &[String], follower_fd: OwnedFd) -> io::Result<std::proc
     let follower_for_stdout = follower_fd.try_clone()?;
     let follower_for_stderr = follower_fd.try_clone()?;
 
-    let mut command = Command::new(&cmd);
+    let mut command = tokio::process::Command::new(&cmd);
     command
         .args(&args)
         .stdin(Stdio::from(follower_fd))
         .stdout(Stdio::from(follower_for_stdout))
-        .stderr(Stdio::from(follower_for_stderr));
+        .stderr(Stdio::from(follower_for_stderr))
+        // Don't let tokio kill the child when the Child handle is dropped —
+        // we manage lifetime explicitly.
+        .kill_on_drop(false);
 
     unsafe {
         command.pre_exec(|| {
-            // Create a new session so the PTY becomes the controlling terminal
             libc::setsid();
-            // Set the controlling terminal
             if libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -436,23 +377,63 @@ fn spawn_child(command: &[String], follower_fd: OwnedFd) -> io::Result<std::proc
 }
 
 // ---------------------------------------------------------------------------
-// Server main loop
+// Server-side state and messages
 // ---------------------------------------------------------------------------
 
-fn server_mainloop(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientState {
+    Replaying, // writer hasn't finished sending the snapshot yet
+    Live,      // bidirectional; included in PTY fan-out
+}
+
+#[derive(Debug)]
+enum OutMsg {
+    Packet(Packet),
+    Shutdown, // writer should drain pending then exit
+}
+
+struct ClientHandle {
+    id: u64,
+    flags: ClientFlags,
+    state: ClientState,
+    is_controller: bool,
+    out_tx: mpsc::Sender<OutMsg>,
+}
+
+enum ControlMsg {
+    /// Intake task finished handshake and the client wants to attach.
+    Register {
+        stream: tokio::net::UnixStream,
+        hello: Hello,
+    },
+    /// Writer task finished sending the replay; client transitions to Live.
+    ClientLive { id: u64 },
+    /// Reader task: client requested a resize.
+    Resize { id: u64, rows: u16, cols: u16 },
+    /// Reader task: client sent Detach (close gracefully).
+    Detach { id: u64 },
+    /// Reader OR writer task: socket closed / I/O error.
+    ClientGone { id: u64 },
+}
+
+// ---------------------------------------------------------------------------
+// Main loop
+// ---------------------------------------------------------------------------
+
+async fn mainloop(
     listener: UnixListener,
-    leader_fd: OwnedFd,
-    mut child: std::process::Child,
+    leader: std::sync::Arc<AsyncFd<OwnedFd>>,
+    child: &mut tokio::process::Child,
     child_pid: u32,
     ring_size: usize,
-    _socket_path: &std::path::Path,
-) -> io::Result<()> {
+) -> Result<(), crate::Error> {
     let mut ring = RingBuffer::new(ring_size);
-    let mut clients: Vec<ServerClient> = Vec::new();
-    // Optional: dump every raw byte read from the PTY leader to a file.
-    // Set MNEME_PTY_LOG=/path/to/file.bin in the environment of the
-    // process that runs `mn new`/`mn create`. The file is appended to
-    // and is the exact byte stream the child wrote.
+    let mut clients: Vec<ClientHandle> = Vec::new();
+    let mut next_id: u64 = 1;
+    let mut child_running = true;
+    let mut exit_status: Option<u32> = None;
+    let mut exit_notified = false;
+
     let mut pty_log = std::env::var("MNEME_PTY_LOG")
         .ok()
         .and_then(|p| {
@@ -463,663 +444,444 @@ fn server_mainloop(
                 .ok()
         });
 
-    let mut child_running = true;
-    let mut exit_status: Option<u32> = None;
-    let mut exit_notified = false; // at least one client saw the exit
-
-    // Set up signal self-pipe for SIGCHLD
-    let (sig_read, sig_write) = pipe_nonblock()?;
-    signal_hook::low_level::pipe::register(signal_hook::consts::SIGCHLD, sig_write)?;
-
-    let mut read_buf = [0u8; READ_BUF_SIZE];
+    let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ControlMsg>();
+    let pty_write_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    let mut read_buf = vec![0u8; READ_BUF_SIZE];
 
     loop {
-        // Build poll fds — collect raw fds to avoid borrow issues
-        let mut pollfds: Vec<PollFd<'_>> = Vec::new();
-
-        // [0] = listener
-        pollfds.push(PollFd::new(&listener, PollFlags::IN));
-        // [1] = PTY leader. We pause reads from the PTY when any LIVE
-        // client doesn't have room in its userspace outbound buffer for
-        // a max-sized read. This applies backpressure all the way to the
-        // child (its writes will block on the PTY) instead of dropping
-        // slow clients. With zero live clients we always read so the
-        // ring buffer keeps filling for future attaches.
-        let pty_paused = clients
-            .iter()
-            .filter(|c| c.state == ClientState::Live)
-            .any(|c| !c.outbound_has_room(READ_BUF_SIZE));
-        let pty_flags = if child_running && !pty_paused {
-            PollFlags::IN
-        } else {
-            PollFlags::empty()
-        };
-        pollfds.push(PollFd::new(&leader_fd, pty_flags));
-        // [2] = signal pipe
-        pollfds.push(PollFd::new(&sig_read, PollFlags::IN));
-        // [3..] = clients
-        for c in &clients {
-            let mut flags = PollFlags::IN;
-            if c.has_pending_output() {
-                flags |= PollFlags::OUT;
-            }
-            pollfds.push(PollFd::new(&c.fd, flags));
-        }
-
-        // poll with no timeout (block indefinitely)
-        match rustix::event::poll(&mut pollfds, None) {
-            Ok(_) => {}
-            Err(rustix::io::Errno::INTR) => continue,
-            Err(e) => return Err(e.into()),
-        }
-
-        // Extract revents before dropping pollfds (which borrow clients)
-        let revents: Vec<PollFlags> = pollfds.iter().map(|p| p.revents()).collect();
-        drop(pollfds);
-
-        // Process signals
-        if revents[2].contains(PollFlags::IN) {
-            // Drain the signal pipe
-            let mut sig_buf = [0u8; 64];
-            let _ = rustix::io::read(&sig_read, &mut sig_buf);
-
-            // Check if child exited
-            if child_running {
-                handle_child_exit(
-                    &mut child,
-                    &mut child_running,
-                    &mut exit_status,
-                    &mut clients,
-                    &mut exit_notified,
-                );
-            }
-        }
-
-        // Accept new clients
-        if revents[0].contains(PollFlags::IN)
-            && let Ok((stream, _)) = listener.accept()
-        {
-            let fd = OwnedFd::from(stream);
-            // Verify peer UID before accepting
-            if verify_peer_uid(&fd).is_err() {
-                drop(fd); // reject connection
-            } else {
-                let _ = rustix::fs::fcntl_setfl(&fd, rustix::fs::OFlags::NONBLOCK);
-                clients.push(ServerClient::new(fd));
-            }
-        }
-
-        // Read from PTY
-        let mut pty_data: Option<Vec<u8>> = None;
-        if revents[1].intersects(PollFlags::IN | PollFlags::HUP) {
-            match protocol::try_read(leader_fd.as_fd(), &mut read_buf) {
-                Ok(0) => {} // would block
-                Ok(n) => {
-                    let data = read_buf[..n].to_vec();
-                    if let Some(ref mut f) = pty_log {
-                        use std::io::Write;
-                        let _ = f.write_all(&data);
-                    }
-                    ring.write(&data);
-                    pty_data = Some(data);
-                }
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    // PTY closed — child exited
-                    handle_child_exit(
-                        &mut child,
-                        &mut child_running,
-                        &mut exit_status,
-                        &mut clients,
-                        &mut exit_notified,
-                    );
-                }
-                Err(e) => {
-                    // EIO is common on macOS when child exits
-                    if e.raw_os_error() == Some(rustix::io::Errno::IO.raw_os_error()) {
-                        handle_child_exit(
-                            &mut child,
-                            &mut child_running,
-                            &mut exit_status,
-                            &mut clients,
-                            &mut exit_notified,
-                        );
-                    }
-                    // else: ignore transient errors
-                }
-            }
-        }
-
-        // Process client I/O
-        let mut to_remove: Vec<usize> = Vec::new();
-
-        for (ci, client) in clients.iter_mut().enumerate() {
-            let poll_idx = 3 + ci;
-            if poll_idx >= revents.len() {
-                break;
-            }
-            let rev = revents[poll_idx];
-
-            // Handle disconnection
-            if rev.intersects(PollFlags::HUP | PollFlags::ERR | PollFlags::NVAL)
-                && !rev.contains(PollFlags::IN)
-            {
-                eprintln!(
-                    "[mn-srv] drop client {ci}: poll revents={rev:?} state={:?}",
-                    client.state
-                );
-                to_remove.push(ci);
-                continue;
-            }
-
-            // Read from client
-            if rev.contains(PollFlags::IN) {
-                match handle_client_input(
-                    client,
-                    &leader_fd,
-                    child_pid,
-                    &ring,
-                    child_running,
-                    exit_status,
-                    &mut exit_notified,
-                ) {
-                    Ok(true) => {} // continue
-                    Ok(false) | Err(_) => {
-                        eprintln!(
-                            "[mn-srv] drop client {ci}: handle_client_input non-ok, state={:?}",
-                            client.state
-                        );
-                        to_remove.push(ci);
-                        continue;
-                    }
-                }
-            }
-
-            // Continue replay if in progress
-            if client.state == ClientState::Replaying
-                && !continue_replay(client, exit_status, &mut exit_notified)
-            {
-                eprintln!("[mn-srv] drop client {ci}: continue_replay false");
-                to_remove.push(ci);
-                continue;
-            }
-
-            // Send PTY data to live clients (chunked to MAX_PAYLOAD).
-            // We only read PTY when every live client has room, so
-            // queue_packet should always succeed here. If it ever
-            // doesn't (e.g. replay-driven backpressure raced us),
-            // log it and skip the chunk rather than dropping the
-            // client — the slow client will catch up next iter.
-            if client.state == ClientState::Live
-                && let Some(ref data) = pty_data
-            {
-                for chunk in data.chunks(protocol::MAX_PAYLOAD) {
-                    let pkt = Packet::content(chunk);
-                    if !client.queue_packet(&pkt) {
-                        eprintln!(
-                            "[mn-srv] client {ci}: outbound full mid-broadcast ({} bytes); skipping chunk",
-                            client.outbound.len()
-                        );
-                        break;
-                    }
-                }
-            }
-
-            // Flush outbound
-            if (rev.contains(PollFlags::OUT) || client.has_pending_output()) && !client.flush() {
-                eprintln!(
-                    "[mn-srv] drop client {ci}: flush() write error, outbound={}",
-                    client.outbound.len()
-                );
-                to_remove.push(ci);
-                continue;
-            }
-        }
-
-        // Remove disconnected clients, then re-elect controller
-        remove_clients(&mut clients, &to_remove);
-
-        // Re-elect controller after any changes
-        // (new clients reaching Live, clients removed, etc.)
-        let old_controller_id = clients.iter().position(|c| c.is_controller);
-        let mut new_controller_id = None;
-        for (i, c) in clients.iter().enumerate().rev() {
-            if c.state == ClientState::Live
-                && !c.flags.contains(ClientFlags::READONLY)
-                && !c.flags.contains(ClientFlags::LOW_PRIORITY)
-            {
-                new_controller_id = Some(i);
-                break;
-            }
-        }
-        // If controller changed, update flags and send ResizeReq
-        if new_controller_id != old_controller_id {
-            for c in clients.iter_mut() {
-                c.is_controller = false;
-            }
-            if let Some(idx) = new_controller_id {
-                clients[idx].is_controller = true;
-                let pkt = Packet::empty(MsgType::ResizeReq);
-                clients[idx].queue_packet(&pkt);
-            }
-        }
-
-        // Server exit condition: child exited, no clients, at least one was notified
+        // Termination condition: child gone, every client notified+drained.
         if !child_running && clients.is_empty() && exit_notified {
             eprintln!("[mn-srv] mainloop exit: child_gone+no_clients+notified");
             break;
+        }
+
+        // PTY readability is only "interesting" while child is running.
+        // To avoid duck-finding #4 (replay clients shouldn't gate PTY),
+        // we always read PTY when child is alive; fan-out only goes to
+        // Live clients.
+        tokio::select! {
+            biased;
+
+            // Child exit ------------------------------------------------
+            res = child.wait(), if child_running => {
+                child_running = false;
+                let status = match res {
+                    Ok(s) => s.code().unwrap_or(1) as u32,
+                    Err(_) => 1,
+                };
+                exit_status = Some(status);
+                eprintln!("[mn-srv] child exited status={status} live_clients={}", clients.len());
+                let pkt = Packet::exit(status);
+                for c in &clients {
+                    if c.state == ClientState::Live {
+                        // Best-effort send; if writer is gone the channel is closed.
+                        let _ = c.out_tx.send(OutMsg::Packet(pkt.clone())).await;
+                        exit_notified = true;
+                    }
+                }
+                // Replaying clients will receive Exit when they transition
+                // to Live (see ClientLive handler). If there are zero
+                // clients at all, we KEEP the server running so a future
+                // attach can pick up the exit status — same behavior as
+                // the original poll-based server.
+            }
+
+            // PTY readable ----------------------------------------------
+            guard = leader.readable(), if child_running => {
+                let mut guard = match guard {
+                    Ok(g) => g,
+                    Err(_) => continue,
+                };
+                match guard.try_io(|inner| {
+                    let fd = inner.get_ref().as_fd();
+                    match rustix::io::read(fd, &mut read_buf) {
+                        Ok(0) => Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+                        Ok(n) => Ok(n),
+                        Err(rustix::io::Errno::AGAIN) => Err(io::ErrorKind::WouldBlock.into()),
+                        Err(e) => Err(io::Error::from(e)),
+                    }
+                }) {
+                    Ok(Ok(n)) => {
+                        let data = &read_buf[..n];
+                        if let Some(ref mut f) = pty_log {
+                            use std::io::Write;
+                            let _ = f.write_all(data);
+                        }
+                        ring.write(data);
+
+                        // Fan out to Live clients (chunked to MAX_PAYLOAD).
+                        // Backpressure: if a Live client's bounded mpsc is
+                        // full, this `await` blocks the PTY read loop.
+                        // That stalls the child via the kernel PTY buffer.
+                        for chunk in data.chunks(MAX_PAYLOAD) {
+                            let pkt = Packet::content(chunk);
+                            for c in &clients {
+                                if c.state == ClientState::Live {
+                                    if c.out_tx.send(OutMsg::Packet(pkt.clone())).await.is_err() {
+                                        // writer task gone; will be cleaned
+                                        // up via ClientGone shortly.
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                        // PTY closed — child exiting. Child::wait will catch up.
+                    }
+                    Ok(Err(e)) => {
+                        // EIO on macOS when child dies; ignore transient others.
+                        eprintln!("[mn-srv] pty read err: {e}");
+                    }
+                    Err(_would_block) => { /* try_io returns Err if ready was spurious; loop */ }
+                }
+            }
+
+            // Listener accept -------------------------------------------
+            accept = listener.accept() => {
+                match accept {
+                    Ok((stream, _addr)) => {
+                        // Peer-uid check on the std stream (rustix/getpeereid).
+                        let std_stream = match stream.into_std() {
+                            Ok(s) => s,
+                            Err(e) => { eprintln!("[mn-srv] into_std: {e}"); continue; }
+                        };
+                        if let Err(e) = verify_peer_uid_std(&std_stream) {
+                            eprintln!("[mn-srv] reject peer: {e}");
+                            continue;
+                        }
+                        // Already non-blocking from the listener; convert back.
+                        std_stream.set_nonblocking(true).ok();
+                        let stream = match tokio::net::UnixStream::from_std(std_stream) {
+                            Ok(s) => s,
+                            Err(e) => { eprintln!("[mn-srv] from_std: {e}"); continue; }
+                        };
+                        // Spawn intake. It owns the stream until handshake done.
+                        let ctx = ctrl_tx.clone();
+                        tokio::spawn(intake_task(stream, ctx, child_running, exit_status, ring.capacity() as u32, ring.len() as u32));
+                    }
+                    Err(e) => eprintln!("[mn-srv] accept: {e}"),
+                }
+            }
+
+            // Control events from intake / reader / writer tasks --------
+            Some(msg) = ctrl_rx.recv() => {
+                match msg {
+                    ControlMsg::Register { stream, hello } => {
+                        let id = next_id; next_id += 1;
+                        let snapshot = ring.snapshot();
+                        let (out_tx, out_rx) = mpsc::channel::<OutMsg>(OUTBOUND_CAP);
+                        let (read_half, write_half) = stream.into_split();
+                        clients.push(ClientHandle {
+                            id,
+                            flags: hello.flags,
+                            state: ClientState::Replaying,
+                            is_controller: false,
+                            out_tx,
+                        });
+                        tokio::spawn(writer_task(id, write_half, snapshot, out_rx, ctrl_tx.clone()));
+                        tokio::spawn(reader_task(id, read_half, ctrl_tx.clone(), leader.clone(), pty_write_lock.clone(), hello.flags));
+                    }
+                    ControlMsg::ClientLive { id } => {
+                        if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
+                            c.state = ClientState::Live;
+                            // If child already exited before this client became
+                            // Live, send Exit immediately so it doesn't hang.
+                            if !child_running && let Some(s) = exit_status {
+                                let _ = c.out_tx.send(OutMsg::Packet(Packet::exit(s))).await;
+                                let _ = c.out_tx.send(OutMsg::Shutdown).await;
+                                exit_notified = true;
+                            }
+                            elect_controller(&mut clients).await;
+                        }
+                    }
+                    ControlMsg::Resize { id, rows, cols } => {
+                        let is_ctrl = clients.iter().find(|c| c.id == id).map(|c| c.is_controller).unwrap_or(false);
+                        if is_ctrl {
+                            let ws = rustix::termios::Winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+                            let _ = rustix::termios::tcsetwinsize(leader.get_ref(), ws);
+                            if let Some(pgid) = rustix::process::Pid::from_raw(child_pid as i32) {
+                                let _ = rustix::process::kill_process_group(pgid, rustix::process::Signal::WINCH);
+                            }
+                        }
+                    }
+                    ControlMsg::Detach { id } => {
+                        if let Some(c) = clients.iter().find(|c| c.id == id) {
+                            let _ = c.out_tx.send(OutMsg::Shutdown).await;
+                        }
+                    }
+                    ControlMsg::ClientGone { id } => {
+                        if let Some(pos) = clients.iter().position(|c| c.id == id) {
+                            clients.remove(pos);
+                            elect_controller(&mut clients).await;
+                        }
+                    }
+                }
+            }
         }
     }
 
     Ok(())
 }
 
+async fn write_pty(leader: &AsyncFd<OwnedFd>, mut buf: &[u8]) {
+    while !buf.is_empty() {
+        let mut guard = match leader.writable().await {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        match guard.try_io(|inner| {
+            let fd = inner.get_ref().as_fd();
+            match rustix::io::write(fd, buf) {
+                Ok(0) => Err(io::Error::from(io::ErrorKind::WriteZero)),
+                Ok(n) => Ok(n),
+                Err(rustix::io::Errno::AGAIN) => Err(io::ErrorKind::WouldBlock.into()),
+                Err(e) => Err(io::Error::from(e)),
+            }
+        }) {
+            Ok(Ok(n)) => buf = &buf[n..],
+            Ok(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Ok(Err(_)) => return,
+            Err(_would_block) => continue,
+        }
+    }
+}
+
+async fn elect_controller(clients: &mut [ClientHandle]) {
+    let old = clients.iter().position(|c| c.is_controller);
+    let mut new_idx = None;
+    for (i, c) in clients.iter().enumerate().rev() {
+        if c.state == ClientState::Live
+            && !c.flags.contains(ClientFlags::READONLY)
+            && !c.flags.contains(ClientFlags::LOW_PRIORITY)
+        {
+            new_idx = Some(i);
+            break;
+        }
+    }
+    if new_idx == old {
+        return;
+    }
+    for c in clients.iter_mut() {
+        c.is_controller = false;
+    }
+    if let Some(i) = new_idx {
+        clients[i].is_controller = true;
+        let pkt = Packet::empty(MsgType::ResizeReq);
+        let _ = clients[i].out_tx.send(OutMsg::Packet(pkt)).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Client input handling
+// Intake task — reads Hello, writes Welcome
 // ---------------------------------------------------------------------------
 
-fn handle_client_input(
-    client: &mut ServerClient,
-    leader_fd: &OwnedFd,
-    child_pid: u32,
-    ring: &RingBuffer,
+async fn intake_task(
+    mut stream: tokio::net::UnixStream,
+    ctrl_tx: mpsc::UnboundedSender<ControlMsg>,
     child_running: bool,
     exit_status: Option<u32>,
-    exit_notified: &mut bool,
-) -> io::Result<bool> {
-    match client.state {
-        ClientState::Connected => {
-            // Expect a Hello — the fd is non-blocking, so we may get
-            // WouldBlock if the client hasn't sent it yet.
-            let pkt = match protocol::recv_packet(client.fd.as_fd()) {
-                Ok(p) => p,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(true),
-                Err(_) => return Ok(false),
-            };
-
-            if pkt.msg_type != MsgType::Hello {
-                let err_pkt = Packet::error("expected Hello");
-                let _ = protocol::send_packet(client.fd.as_fd(), &err_pkt);
-                return Ok(false);
-            }
-
-            let hello = match pkt.parse_hello() {
-                Some(h) => h,
-                None => return Ok(false),
-            };
-
-            // Version check
-            if hello.version != PROTOCOL_VERSION {
-                let err_pkt = Packet::error(&format!(
+    ring_size: u32,
+    ring_used: u32,
+) {
+    // Bounded handshake time so a malicious or stuck peer can't hold a
+    // connection slot forever.
+    let res = tokio::time::timeout(HELLO_TIMEOUT, async {
+        let pkt = recv_packet(&mut stream).await?;
+        if pkt.msg_type != MsgType::Hello {
+            let _ = send_packet(&mut stream, &Packet::error("expected Hello")).await;
+            return Err(io::Error::other("not Hello"));
+        }
+        let hello = pkt
+            .parse_hello()
+            .ok_or_else(|| io::Error::other("malformed Hello"))?;
+        if hello.version != PROTOCOL_VERSION {
+            let _ = send_packet(
+                &mut stream,
+                &Packet::error(&format!(
                     "protocol version mismatch: client={}, server={}",
                     hello.version, PROTOCOL_VERSION
-                ));
-                let _ = protocol::send_packet(client.fd.as_fd(), &err_pkt);
-                return Ok(false);
-            }
-
-            client.flags = hello.flags;
-
-            // Build Welcome
-            let welcome = protocol::Welcome {
-                version: PROTOCOL_VERSION,
-                server_pid: std::process::id(),
-                child_pid: 0, // TODO: track properly
-                child_running,
-                exit_status: exit_status.unwrap_or(0) as u8,
-                client_count: 0, // TODO: accurate count
-                ring_size: ring.capacity() as u32,
-                ring_used: ring.len() as u32,
-            };
-            let welcome_pkt = Packet::welcome(&welcome);
-            if !client.queue_packet(&welcome_pkt) {
-                return Ok(false);
-            }
-
-            match hello.intent {
-                Intent::Query => {
-                    // Flush and disconnect
-                    client.flush();
-                    return Ok(false);
-                }
-                Intent::Attach => {
-                    // Start replay
-                    let snapshot = ring.snapshot();
-                    if snapshot.is_empty() {
-                        // No replay needed
-                        let end_pkt = Packet::empty(MsgType::ReplayEnd);
-                        if !client.queue_packet(&end_pkt) {
-                            return Ok(false);
-                        }
-                        client.state = ClientState::Live;
-
-                        if let Some(status) = exit_status {
-                            let exit_pkt = Packet::exit(status);
-                            if !client.queue_packet(&exit_pkt) {
-                                return Ok(false);
-                            }
-                            *exit_notified = true;
-                        }
-
-                        if !client.flags.contains(ClientFlags::READONLY)
-                            && !client.flags.contains(ClientFlags::LOW_PRIORITY)
-                        {
-                            // Controller will be elected in the main loop
-                        }
-                    } else {
-                        client.replay_buf = Some(snapshot);
-                        client.replay_pos = 0;
-                        client.state = ClientState::Replaying;
-                    }
-                }
-            }
+                )),
+            )
+            .await;
+            return Err(io::Error::other("version mismatch"));
         }
-        ClientState::Replaying => {
-            // Input ignored during replay — just drain the socket
-            let mut buf = [0u8; READ_BUF_SIZE];
-            let _ = protocol::try_read(client.fd.as_fd(), &mut buf);
-        }
-        ClientState::Live => {
-            let pkt = match protocol::recv_packet(client.fd.as_fd()) {
-                Ok(p) => p,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(true),
-                Err(_) => return Ok(false),
-            };
 
-            match pkt.msg_type {
-                MsgType::Content if !client.flags.contains(ClientFlags::READONLY) => {
-                    let _ = protocol::write_all_fd(leader_fd.as_fd(), &pkt.payload);
-                }
-                MsgType::Resize => {
-                    if client.is_controller
-                        && let Some((rows, cols)) = pkt.parse_resize()
-                    {
-                        let ws = rustix::termios::Winsize {
-                            ws_row: rows,
-                            ws_col: cols,
-                            ws_xpixel: 0,
-                            ws_ypixel: 0,
-                        };
-                        let _ = rustix::termios::tcsetwinsize(leader_fd, ws);
-                        // Signal the child's process group to redraw.
-                        // The child called setsid() so its PGID == its PID.
-                        if let Some(pgid) = rustix::process::Pid::from_raw(child_pid as i32) {
-                            let _ = rustix::process::kill_process_group(
-                                pgid,
-                                rustix::process::Signal::WINCH,
-                            );
-                        }
-                    }
-                }
-                MsgType::Detach => {
-                    return Ok(false);
-                }
-                _ => {}
+        let welcome = protocol::Welcome {
+            version: PROTOCOL_VERSION,
+            server_pid: std::process::id(),
+            child_pid: 0,
+            child_running,
+            exit_status: exit_status.unwrap_or(0) as u8,
+            client_count: 0,
+            ring_size,
+            ring_used,
+        };
+        send_packet(&mut stream, &Packet::welcome(&welcome)).await?;
+
+        Ok::<_, io::Error>(hello)
+    })
+    .await;
+
+    match res {
+        Ok(Ok(hello)) => match hello.intent {
+            Intent::Query => {
+                // Drop after Welcome.
             }
-        }
+            Intent::Attach => {
+                let _ = ctrl_tx.send(ControlMsg::Register { stream, hello });
+            }
+        },
+        Ok(Err(e)) => eprintln!("[mn-srv] intake error: {e}"),
+        Err(_) => eprintln!("[mn-srv] intake timed out"),
     }
-
-    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
-// Replay continuation
+// Per-client writer task
 // ---------------------------------------------------------------------------
 
-fn continue_replay(
-    client: &mut ServerClient,
-    exit_status: Option<u32>,
-    exit_notified: &mut bool,
-) -> bool {
-    if let Some(ref buf) = client.replay_buf {
-        let remaining = buf.len() - client.replay_pos;
-        if remaining == 0 {
-            // Gate the ReplayEnd (and any follow-on Exit) on outbound
-            // having room — same backpressure rule as the chunk loop
-            // below. Returning true keeps the client alive; we'll retry
-            // next iteration after flush() drains some bytes.
-            let end_pkt = Packet::empty(MsgType::ReplayEnd);
-            let mut needed = end_pkt.encode().len();
-            let exit_pkt = exit_status.map(Packet::exit);
-            if let Some(ref p) = exit_pkt {
-                needed += p.encode().len();
-            }
-            if !client.outbound_has_room(needed) {
-                return true; // backpressure
-            }
-
-            client.replay_buf = None;
-            // queue_packet cannot fail here — we just verified room.
-            client.queue_packet(&end_pkt);
-            client.state = ClientState::Live;
-
-            if let Some(p) = exit_pkt {
-                client.queue_packet(&p);
-                *exit_notified = true;
-            }
-
-            if !client.flags.contains(ClientFlags::READONLY)
-                && !client.flags.contains(ClientFlags::LOW_PRIORITY)
-            {
-                // Controller will be elected in the main loop
-            }
-
-            return true;
-        }
-
-        let chunk_size = remaining.min(protocol::MAX_PAYLOAD);
-        let chunk = &buf[client.replay_pos..client.replay_pos + chunk_size];
-        let pkt = Packet::replay(chunk);
-        // Backpressure: if outbound doesn't have room for this chunk,
-        // skip queueing this iteration. has_pending_output() keeps
-        // POLLOUT registered, so we'll be re-polled when the client
-        // drains and flush() makes room.
-        if !client.outbound_has_room(pkt.encode().len()) {
-            return true;
-        }
-        // queue_packet cannot fail — we just verified room.
-        client.queue_packet(&pkt);
-        client.replay_pos += chunk_size;
-    }
-
-    true
-}
-
-fn handle_child_exit(
-    child: &mut std::process::Child,
-    child_running: &mut bool,
-    exit_status: &mut Option<u32>,
-    clients: &mut Vec<ServerClient>,
-    exit_notified: &mut bool,
+async fn writer_task(
+    id: u64,
+    mut w: OwnedWriteHalf,
+    snapshot: Vec<u8>,
+    mut rx: mpsc::Receiver<OutMsg>,
+    ctrl_tx: mpsc::UnboundedSender<ControlMsg>,
 ) {
-    if !*child_running {
+    // 1. Send replay snapshot.
+    let mut ok = true;
+    if !snapshot.is_empty() {
+        for chunk in snapshot.chunks(MAX_PAYLOAD) {
+            let pkt = Packet::replay(chunk);
+            if write_pkt(&mut w, &pkt).await.is_err() {
+                ok = false;
+                break;
+            }
+        }
+    }
+    if ok && write_pkt(&mut w, &Packet::empty(MsgType::ReplayEnd)).await.is_err() {
+        ok = false;
+    }
+    if !ok {
+        let _ = ctrl_tx.send(ControlMsg::ClientGone { id });
         return;
     }
-    *child_running = false;
-    *exit_status = match child.try_wait() {
-        Ok(Some(status)) => Some(status.code().unwrap_or(1) as u32),
-        Ok(None) => {
-            // Child hasn't been reaped yet (EIO arrived before SIGCHLD).
-            // Do a blocking wait — the child is already dead, this returns immediately.
-            match child.wait() {
-                Ok(status) => Some(status.code().unwrap_or(1) as u32),
-                Err(_) => Some(1),
+    // 2. Notify main: client is Live.
+    if ctrl_tx.send(ControlMsg::ClientLive { id }).is_err() {
+        return;
+    }
+    // 3. Drain outbound channel.
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            OutMsg::Packet(p) => {
+                if write_pkt(&mut w, &p).await.is_err() {
+                    let _ = ctrl_tx.send(ControlMsg::ClientGone { id });
+                    return;
+                }
             }
-        }
-        Err(_) => Some(1),
-    };
-    eprintln!(
-        "[mn-srv] handle_child_exit: status={:?} n_clients={}",
-        exit_status,
-        clients.len()
-    );
-
-    // Send Exit to all live clients
-    let pkt = Packet::exit(exit_status.unwrap());
-    let mut to_remove = Vec::new();
-    for (i, c) in clients.iter_mut().enumerate() {
-        if c.state == ClientState::Live {
-            if !c.queue_packet(&pkt) {
-                to_remove.push(i);
-            }
-            *exit_notified = true;
+            OutMsg::Shutdown => break,
         }
     }
-    remove_clients(clients, &to_remove);
+    // Graceful close: shut the write half so the client sees EOF.
+    let _ = w.shutdown().await;
+    let _ = ctrl_tx.send(ControlMsg::ClientGone { id });
 }
 
 // ---------------------------------------------------------------------------
-// Controller election
+// Per-client reader task
 // ---------------------------------------------------------------------------
 
-fn remove_clients(clients: &mut Vec<ServerClient>, indices: &[usize]) {
-    if indices.is_empty() {
-        return;
-    }
-    let mut sorted = indices.to_vec();
-    sorted.sort_unstable();
-    sorted.dedup();
-    for &i in sorted.iter().rev() {
-        if i < clients.len() {
-            clients.remove(i);
+async fn reader_task(
+    id: u64,
+    mut r: OwnedReadHalf,
+    ctrl_tx: mpsc::UnboundedSender<ControlMsg>,
+    leader: std::sync::Arc<AsyncFd<OwnedFd>>,
+    pty_write_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    flags: ClientFlags,
+) {
+    let readonly = flags.contains(ClientFlags::READONLY);
+    loop {
+        let pkt = match recv_packet_half(&mut r).await {
+            Ok(p) => p,
+            Err(_) => break,
+        };
+        let send_ok = match pkt.msg_type {
+            MsgType::Content => {
+                // Hot path: write straight to the PTY leader, skipping
+                // the main task. The Mutex serializes against other
+                // reader tasks (main never writes the PTY).
+                if !readonly {
+                    let _g = pty_write_lock.lock().await;
+                    write_pty(&leader, &pkt.payload).await;
+                }
+                true
+            }
+            MsgType::Resize => match pkt.parse_resize() {
+                Some((rows, cols)) => ctrl_tx.send(ControlMsg::Resize { id, rows, cols }).is_ok(),
+                None => true,
+            },
+            MsgType::Detach => {
+                let _ = ctrl_tx.send(ControlMsg::Detach { id });
+                break;
+            }
+            _ => true, // ignore unexpected messages
+        };
+        if !send_ok {
+            break;
         }
     }
+    let _ = ctrl_tx.send(ControlMsg::ClientGone { id });
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Async packet I/O helpers (cancellation-safe variants are NOT provided —
+// callers must own their stream and not race these inside select!).
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+async fn send_packet(stream: &mut tokio::net::UnixStream, pkt: &Packet) -> io::Result<()> {
+    let buf = pkt.encode();
+    stream.write_all(&buf).await
+}
 
-    /// Build a ServerClient backed by one end of a socketpair, in Replaying
-    /// state with `replay_size` bytes of payload to send.
-    fn replaying_client(replay_size: usize) -> (ServerClient, std::os::unix::net::UnixStream) {
-        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
-        // The "server" side: nonblocking, owned by ServerClient.
-        a.set_nonblocking(true).unwrap();
-        let owned = OwnedFd::from(a);
-        let mut c = ServerClient::new(owned);
-        c.replay_buf = Some(vec![0xABu8; replay_size]);
-        c.state = ClientState::Replaying;
-        // Return the peer end so the test holds it open (and can drain).
-        (c, b)
+async fn recv_packet(stream: &mut tokio::net::UnixStream) -> io::Result<Packet> {
+    let mut header = [0u8; HEADER_SIZE];
+    stream.read_exact(&mut header).await?;
+    let msg_type = MsgType::from_u8(header[0])
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown message type"))?;
+    let len = u16::from_le_bytes([header[1], header[2]]) as usize;
+    if len > MAX_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "payload too large",
+        ));
     }
-
-    /// Regression: when a slow client lets the server's per-client outbound
-    /// queue fill up during replay, `continue_replay` must back-pressure
-    /// (return true without queueing) instead of returning false (which the
-    /// main loop interprets as "drop this client"). Before the fix, the
-    /// server would close brand-new attaches to busy sessions with
-    /// "unexpected end of file".
-    #[test]
-    fn continue_replay_backpressures_when_outbound_full() {
-        // Replay larger than OUTBOUND_LIMIT so we must definitely block.
-        let (mut client, _peer) = replaying_client(OUTBOUND_LIMIT * 2);
-        let mut notified = false;
-
-        // Drive continue_replay repeatedly without ever flushing. With the
-        // bug it returned false once outbound exceeded OUTBOUND_LIMIT and
-        // the server dropped the client. With the fix it must keep
-        // returning true and just stop growing the queue.
-        for i in 0..1_000 {
-            let alive = continue_replay(&mut client, None, &mut notified);
-            assert!(
-                alive,
-                "continue_replay returned false on iteration {i} \
-                 (outbound={}, replay_pos={}) — slow attach would be dropped",
-                client.outbound.len(),
-                client.replay_pos
-            );
-            assert!(
-                client.outbound.len() <= OUTBOUND_LIMIT,
-                "outbound exceeded limit on iteration {i}: {} > {}",
-                client.outbound.len(),
-                OUTBOUND_LIMIT
-            );
-        }
-
-        // Sanity: we are still in Replaying with progress made and queue
-        // sitting near (but not above) the limit.
-        assert_eq!(client.state, ClientState::Replaying);
-        assert!(client.replay_pos > 0);
-        assert!(client.outbound.len() > OUTBOUND_LIMIT - 2 * protocol::MAX_PAYLOAD);
+    let mut payload = vec![0u8; len];
+    if len > 0 {
+        stream.read_exact(&mut payload).await?;
     }
+    Ok(Packet::new(msg_type, payload))
+}
 
-    /// After the queue drains, `continue_replay` must resume queueing so
-    /// replay eventually completes. Without this, backpressure could turn
-    /// into a deadlock.
-    #[test]
-    fn continue_replay_resumes_after_drain() {
-        let (mut client, peer) = replaying_client(OUTBOUND_LIMIT * 4);
-        let mut notified = false;
+async fn write_pkt(w: &mut OwnedWriteHalf, pkt: &Packet) -> io::Result<()> {
+    let buf = pkt.encode();
+    w.write_all(&buf).await
+}
 
-        // Fill outbound.
-        for _ in 0..1_000 {
-            assert!(continue_replay(&mut client, None, &mut notified));
-        }
-        let stalled_pos = client.replay_pos;
-        assert!(client.outbound.len() > OUTBOUND_LIMIT - 2 * protocol::MAX_PAYLOAD);
-
-        // Flush into the socketpair, then drain it on the peer side.
-        assert!(client.flush());
-        peer.set_nonblocking(true).unwrap();
-        use std::io::Read;
-        let mut sink = [0u8; 64 * 1024];
-        let mut total = 0;
-        loop {
-            match (&peer).read(&mut sink) {
-                Ok(0) => break,
-                Ok(n) => total += n,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                Err(_) => break,
-            }
-        }
-        assert!(total > 0, "peer should have drained some bytes");
-
-        // Now the server-side queue is empty (or nearly so); flush again
-        // to push remaining outbound into the kernel buffer.
-        assert!(client.flush());
-
-        // continue_replay should now make progress past where we stalled.
-        for _ in 0..100 {
-            assert!(continue_replay(&mut client, None, &mut notified));
-        }
-        assert!(
-            client.replay_pos > stalled_pos,
-            "replay_pos did not advance after drain: still {stalled_pos}"
-        );
+async fn recv_packet_half(r: &mut OwnedReadHalf) -> io::Result<Packet> {
+    let mut header = [0u8; HEADER_SIZE];
+    r.read_exact(&mut header).await?;
+    let msg_type = MsgType::from_u8(header[0])
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown message type"))?;
+    let len = u16::from_le_bytes([header[1], header[2]]) as usize;
+    if len > MAX_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "payload too large",
+        ));
     }
-
-    /// `ReplayEnd` (and any trailing `Exit`) must also respect
-    /// backpressure — they should not be silently skipped, but they also
-    /// must not drop the client when the queue is full.
-    #[test]
-    fn continue_replay_end_is_gated_on_outbound_room() {
-        // Tiny replay so we reach the "remaining == 0" branch quickly.
-        let (mut client, _peer) = replaying_client(8);
-        let mut notified = false;
-
-        // Drain the small payload first.
-        assert!(continue_replay(&mut client, None, &mut notified));
-
-        // Now manually stuff outbound to nearly full so ReplayEnd won't fit.
-        let pad = OUTBOUND_LIMIT - client.outbound.len();
-        client.outbound.extend(std::iter::repeat_n(0u8, pad));
-        assert_eq!(client.outbound.len(), OUTBOUND_LIMIT);
-
-        // Should backpressure: stay alive, stay in Replaying.
-        assert!(continue_replay(&mut client, None, &mut notified));
-        assert_eq!(client.state, ClientState::Replaying);
-        assert!(client.replay_buf.is_some());
-
-        // Drop a few bytes to simulate flush progress.
-        client.outbound.drain(..16);
-
-        // Now ReplayEnd fits → state transitions to Live.
-        assert!(continue_replay(&mut client, None, &mut notified));
-        assert_eq!(client.state, ClientState::Live);
-        assert!(client.replay_buf.is_none());
+    let mut payload = vec![0u8; len];
+    if len > 0 {
+        r.read_exact(&mut payload).await?;
     }
+    Ok(Packet::new(msg_type, payload))
 }
