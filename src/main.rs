@@ -4,7 +4,9 @@ mod ring;
 mod server;
 mod socket;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::CompleteEnv;
+use clap_complete::engine::{ArgValueCandidates, CompletionCandidate};
 use std::env;
 use std::os::fd::{AsFd, AsRawFd};
 use std::process;
@@ -75,6 +77,13 @@ fn main() {
         }
     }
 
+    // Dynamic shell completion. When the COMPLETE env var is set (by the
+    // shell stub registered via `COMPLETE=<shell> mn`), this generates
+    // candidates and exits. Otherwise it returns and normal CLI parsing
+    // proceeds. Placed after the `--server` short-circuit so completion
+    // never runs in server-spawn paths.
+    CompleteEnv::with_factory(Cli::command).complete();
+
     let cli = Cli::parse();
 
     match run_cli(cli) {
@@ -136,6 +145,56 @@ fn parse_detach_key(s: &str) -> Result<u8, String> {
     } else {
         Err(format!("invalid detach key: {s}"))
     }
+}
+
+// -- Completion helpers -----------------------------------------------------
+
+/// List names of currently-live sessions for shell completion. Errors and
+/// stale entries are silently skipped — completion must never fail loudly.
+fn live_session_names() -> Vec<String> {
+    let dir = match socket::socket_dir() {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+    let mut names = Vec::new();
+    for entry in entries.flatten() {
+        use std::os::unix::fs::FileTypeExt;
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.file_type().is_socket() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".lock") {
+            continue;
+        }
+        // Skip dead sessions so users don't tab-complete to a stale name.
+        if let Ok(lock_path) = socket::lock_path(&name)
+            && socket::is_session_stale(&lock_path)
+        {
+            continue;
+        }
+        names.push(name);
+    }
+    names.sort_unstable();
+    names
+}
+
+fn session_candidates() -> Vec<CompletionCandidate> {
+    live_session_names()
+        .into_iter()
+        .map(CompletionCandidate::new)
+        .collect()
+}
+
+/// Same as `session_candidates` plus the literal `all` keyword used by `kill`.
+fn session_candidates_with_all() -> Vec<CompletionCandidate> {
+    let mut v = session_candidates();
+    v.push(CompletionCandidate::new("all").help(Some("kill every session".into())));
+    v
 }
 
 fn parse_size(s: &str) -> Result<usize, String> {
@@ -202,6 +261,7 @@ struct NewOpts {
 #[derive(Parser, Debug)]
 struct AttachOpts {
     /// Session name.
+    #[arg(add = ArgValueCandidates::new(session_candidates))]
     name: String,
 
     /// Detach key (e.g. ^q for Ctrl-Q).
@@ -224,6 +284,7 @@ struct AttachOpts {
 #[derive(Parser, Debug)]
 struct KillOpts {
     /// Session name (or "all" to kill every session).
+    #[arg(add = ArgValueCandidates::new(session_candidates_with_all))]
     name: String,
 
     /// Suppress informational messages.
@@ -234,6 +295,7 @@ struct KillOpts {
 #[derive(Parser, Debug)]
 struct AutoOpts {
     /// Session name.
+    #[arg(add = ArgValueCandidates::new(session_candidates))]
     name: String,
 
     /// Command to run if creating a new session.
