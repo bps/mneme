@@ -248,7 +248,9 @@ fn term_reaches_signal_resistant_active_foreground_group() {
     "#,
     )
     .unwrap();
-    let script = format!("set -m; /bin/sh '{}' \"$1\"", script_path.display());
+    // Keep Bash alive after the foreground command: a tail exec would leave
+    // the fixture in the original shell group instead of a separate job group.
+    let script = format!("set -m; /bin/sh '{}' \"$1\"; wait", script_path.display());
     let mut session = Session::start("/bin/bash", &script);
     let foreground = session.pids[0];
     assert_ne!(

@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 
+mod common;
+
 fn mn_bin() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_mn"))
 }
@@ -146,6 +148,15 @@ fn server_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
+fn wait_for_server_exit(pid: u32) {
+    // Notification precedes cleanup and orphan reaping. Poll the outcome
+    // instead of assuming the host completes both within a fixed sleep.
+    assert!(
+        common::wait_for(Duration::from_secs(5), || !server_alive(pid)),
+        "server should exit after client notification"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -175,11 +186,7 @@ fn normal_exit_zero() {
     );
 
     // Now the server should exit (client was notified)
-    std::thread::sleep(Duration::from_millis(500));
-    assert!(
-        !server_alive(pid),
-        "server should exit after client notification"
-    );
+    wait_for_server_exit(pid);
 }
 
 #[test]
@@ -192,8 +199,7 @@ fn normal_exit_nonzero() {
     let r = attach_and_collect(&socket);
     assert_eq!(r.exit_status, Some(42), "expected exit status 42");
 
-    std::thread::sleep(Duration::from_millis(500));
-    assert!(!server_alive(pid), "server should exit after notification");
+    wait_for_server_exit(pid);
 }
 
 #[test]
@@ -215,8 +221,7 @@ fn child_killed_by_signal() {
     // Shell typically reports 128+signum or similar nonzero
     assert_ne!(status, 0, "signal death should be nonzero: {status}");
 
-    std::thread::sleep(Duration::from_millis(500));
-    assert!(!server_alive(pid), "server should exit");
+    wait_for_server_exit(pid);
 }
 
 #[test]
@@ -239,11 +244,7 @@ fn exited_session_queryable() {
     let r = attach_and_collect(&socket);
     assert_eq!(r.exit_status, Some(0));
 
-    std::thread::sleep(Duration::from_millis(500));
-    assert!(
-        !server_alive(pid),
-        "server should exit after attach notification"
-    );
+    wait_for_server_exit(pid);
 }
 
 #[test]
@@ -365,11 +366,7 @@ fn server_exits_only_after_client_notified() {
     assert_eq!(r.exit_status, Some(0));
 
     // Server should exit now
-    std::thread::sleep(Duration::from_millis(500));
-    assert!(
-        !server_alive(pid),
-        "server should exit after client was notified"
-    );
+    wait_for_server_exit(pid);
 }
 
 #[test]
