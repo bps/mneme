@@ -34,35 +34,69 @@ fn cmd(dir: &Path) -> Command {
     cmd
 }
 
+// Drain both pipes while the direct child runs. A descendant can retain a
+// writer after the child exits, so EOF is not a completion condition.
+fn read_available(
+    reader: &mut impl io::Read,
+    output: &mut Vec<u8>,
+    deadline: Instant,
+) -> io::Result<()> {
+    let mut buffer = [0; 4096];
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "output collection deadline exceeded",
+            ));
+        }
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(n) => output.extend_from_slice(&buffer[..n]),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn wait(child: &mut Child) -> Output {
     let deadline = Instant::now() + Duration::from_secs(8);
-    while child.try_wait().unwrap().is_none() {
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            panic!("subprocess deadline exceeded");
-        }
-        std::thread::sleep(Duration::from_millis(10));
+    let mut stdout_pipe = child.stdout.take().unwrap();
+    let mut stderr_pipe = child.stderr.take().unwrap();
+    for fd in [stdout_pipe.as_fd(), stderr_pipe.as_fd()] {
+        let flags = rustix::fs::fcntl_getfl(fd).unwrap();
+        rustix::fs::fcntl_setfl(fd, flags | rustix::fs::OFlags::NONBLOCK).unwrap();
     }
-    use std::io::Read;
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
-    child
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_end(&mut stdout)
-        .unwrap();
-    child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_end(&mut stderr)
-        .unwrap();
-    Output {
-        status: child.wait().unwrap(),
-        stdout,
-        stderr,
+    loop {
+        let result = (|| {
+            read_available(&mut stdout_pipe, &mut stdout, deadline)?;
+            read_available(&mut stderr_pipe, &mut stderr, deadline)?;
+            let status = child.try_wait()?;
+            if status.is_some() {
+                // All writes from the direct child are now buffered. Collect
+                // them, but do not wait for EOF from unrelated inherited copies.
+                read_available(&mut stdout_pipe, &mut stdout, deadline)?;
+                read_available(&mut stderr_pipe, &mut stderr, deadline)?;
+            }
+            Ok::<_, io::Error>(status)
+        })();
+        match result {
+            Ok(Some(status)) => {
+                return Output {
+                    status,
+                    stdout,
+                    stderr,
+                };
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("subprocess collection failed: {e}");
+            }
+        }
     }
 }
 
@@ -304,25 +338,34 @@ fn concurrent_creators_start_only_one_child() {
     let dir = private_dir();
     let marker = dir.path().join("starts");
     let barrier = Arc::new(Barrier::new(9));
-    let mut threads = Vec::new();
+    let (finished_tx, finished_rx) = mpsc::channel();
     for _ in 0..8 {
         let barrier = barrier.clone();
         let dir = dir.path().to_owned();
         let command = format!("echo started >> '{}'", marker.display());
-        threads.push(std::thread::spawn(move || {
+        let finished_tx = finished_tx.clone();
+        std::thread::spawn(move || {
             barrier.wait();
-            wait(
+            let output = wait(
                 &mut cmd(&dir)
                     .args(["new", "race", "/bin/sh", "-c", &command])
                     .spawn()
                     .unwrap(),
-            )
-        }));
+            );
+            let _ = finished_tx.send(output);
+        });
     }
+    drop(finished_tx);
     barrier.wait();
-    let successes = threads
-        .into_iter()
-        .map(|thread| thread.join().unwrap())
+    // Bound the caller too: spawn or a broken worker must not leave the
+    // suite blocked in JoinHandle::join while holding TEST_LOCK.
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let successes = (0..8)
+        .map(|_| {
+            finished_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("concurrent creator did not report before the collection deadline")
+        })
         .filter(|output| output.status.success())
         .count();
     assert_eq!(successes, 1, "only the winning server may report readiness");
@@ -570,5 +613,125 @@ fn server_waits_for_discovery_probe_to_release() {
         )
         .status
         .success()
+    );
+}
+
+#[test]
+// Deliberately exit before this descendant to test inherited pipe writers.
+#[allow(clippy::zombie_processes)]
+fn capture_direct_helper() {
+    let Some(dir) = std::env::var_os("MNEME_TEST_CAPTURE_HELPER") else {
+        return;
+    };
+    let _holder = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "capture_holder_helper",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("MNEME_TEST_CAPTURE_HOLDER", dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    println!("capture-direct-stdout");
+    eprintln!("capture-direct-stderr");
+}
+
+#[test]
+fn capture_holder_helper() {
+    let Some(dir) = std::env::var_os("MNEME_TEST_CAPTURE_HOLDER") else {
+        return;
+    };
+    let dir = Path::new(&dir);
+    std::fs::write(dir.join("holder-ready"), []).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !dir.join("holder-release").exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::fs::write(dir.join("holder-exited"), []).unwrap();
+    assert!(
+        dir.join("holder-release").exists(),
+        "holder release deadline exceeded"
+    );
+}
+
+#[test]
+fn collection_returns_after_child_exit_without_inherited_pipe_eof() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = private_dir();
+    // Always release the descendant if an assertion fails.
+    struct ReleaseOnDrop(std::path::PathBuf);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, []);
+        }
+    }
+    let release = ReleaseOnDrop(dir.path().join("holder-release"));
+    let mut helper = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "capture_direct_helper",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("MNEME_TEST_CAPTURE_HELPER", dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    until(|| dir.path().join("holder-ready").exists());
+    let out = wait(&mut helper);
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("capture-direct-stdout"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("capture-direct-stderr"));
+    assert!(
+        !dir.path().join("holder-exited").exists(),
+        "collector waited for inherited pipe EOF"
+    );
+    drop(release);
+    until(|| dir.path().join("holder-exited").exists());
+}
+
+#[test]
+fn capture_large_output_helper() {
+    if std::env::var_os("MNEME_TEST_LARGE_CAPTURE").is_none() {
+        return;
+    }
+    use std::io::Write;
+    std::io::stdout()
+        .write_all(&vec![b'x'; 256 * 1024])
+        .unwrap();
+    std::io::stderr()
+        .write_all(&vec![b'y'; 256 * 1024])
+        .unwrap();
+}
+
+#[test]
+fn collection_drains_both_pipes_before_child_exit() {
+    let _serial = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut helper = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "capture_large_output_helper",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("MNEME_TEST_LARGE_CAPTURE", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let out = wait(&mut helper);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        out.stdout.iter().filter(|&&b| b == b'x').count(),
+        256 * 1024
+    );
+    assert_eq!(
+        out.stderr.iter().filter(|&&b| b == b'y').count(),
+        256 * 1024
     );
 }

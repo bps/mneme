@@ -88,7 +88,14 @@ fn open_pty() -> io::Result<(OwnedFd, OwnedFd)> {
     if ret != 0 {
         return Err(io::Error::last_os_error());
     }
-    unsafe { Ok((OwnedFd::from_raw_fd(leader), OwnedFd::from_raw_fd(follower))) }
+    let (leader, follower) =
+        unsafe { (OwnedFd::from_raw_fd(leader), OwnedFd::from_raw_fd(follower)) };
+    // Setup is single-threaded, before the runtime or child is started.
+    // dup2 onto the command's stdio clears CLOEXEC on 0/1/2, but the
+    // original master and slave must not survive the command's exec.
+    rustix::io::fcntl_setfd(&leader, rustix::io::FdFlags::CLOEXEC)?;
+    rustix::io::fcntl_setfd(&follower, rustix::io::FdFlags::CLOEXEC)?;
+    Ok((leader, follower))
 }
 
 #[cfg(target_os = "macos")]
@@ -1070,6 +1077,19 @@ async fn recv_packet_half(r: &mut OwnedReadHalf) -> io::Result<Packet> {
 mod startup_tests {
     use super::*;
     use std::os::fd::IntoRawFd;
+
+    #[test]
+    fn pty_descriptors_are_close_on_exec() {
+        let (leader, follower) = open_pty().unwrap();
+        for fd in [&leader, &follower] {
+            assert!(
+                rustix::io::fcntl_getfd(fd)
+                    .unwrap()
+                    .contains(rustix::io::FdFlags::CLOEXEC),
+                "PTY descriptors must not leak into execed commands"
+            );
+        }
+    }
 
     #[test]
     fn internal_server_rejects_invalid_capacity_and_reports_it() {
