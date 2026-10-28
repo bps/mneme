@@ -1,6 +1,19 @@
-# Tokio port: A/B benchmark results
+# Historical Tokio port: A/B benchmark results
 
-Branch `tokio-port` ports the whole crate from a hand-rolled `rustix::event::poll` event loop to tokio (current_thread runtime). All existing integration tests pass.
+This document records measurements and architecture from the original
+`tokio-port` experiment. Labels such as `main`, line counts, queue behavior,
+and test-pass statements refer to that experiment, not the current source.
+These measurements do not prove current correctness or performance.
+
+The port replaced a hand-rolled `rustix::event::poll` event loop with a Tokio
+current-thread runtime. Subsequent corrections changed replay, bounded queues,
+control responsiveness, readiness, locking, metadata, and shutdown. Consult
+[DESIGN.md](DESIGN.md), [PROTOCOL.md](PROTOCOL.md), and
+[E2E_TESTING.md](E2E_TESTING.md) for current behavior and validation commands.
+Do not use the historical `send().await` description as the current control-loop
+policy. The server now pauses PTY ingestion without awaiting full output queues.
+The legacy benchmark shell scripts use broad process-kill cleanup and are not
+safe validation commands on a host with unrelated sessions.
 
 ## Architecture changes
 
@@ -80,7 +93,9 @@ CLI startup is identical between branches — the current_thread runtime adds es
 
 - ~400 fewer LOC in the core server.
 - The deletion of every "manual state machine" pattern (poll-flag tracking, partial-write buffering, replay-position bookkeeping). Per-client behavior is now a linear async function.
-- Compiler-checked correctness for backpressure (a bounded mpsc *will* block when full; you can't forget to re-arm POLLOUT).
+- Bounded mpsc capacity instead of manually re-arming POLLOUT. This bounded
+  individual queues, but did not prove correct replay ordering, responsive
+  controls, or bounded shutdown. Those properties require separate tests.
 - Free SIGCHLD via `tokio::process::Child::wait()`.
 - ~+15% throughput, tied latency.
 

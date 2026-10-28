@@ -1,11 +1,18 @@
-# Throughput experiment: 2026-04-15
+# Historical throughput experiment: 2026-04-15
 
-## Summary
+## Scope
 
-mn adds **< 2% throughput overhead** and **~12µs latency** vs a raw PTY.
-No server optimization was needed — the benchmark was broken.
+This is a historical experiment, not validation of the current source.
+References to `main`, the poll loop, or VecDeque describe the implementation
+at measurement time. Current architecture and correctness policies appear in
+[DESIGN.md](DESIGN.md) and [E2E_TESTING.md](E2E_TESTING.md).
 
-## Final numbers (on main, unmodified server code)
+The original summary claimed less than 2% throughput overhead. The retained
+table below instead shows about 25%. Do not treat the conflicting summary as
+a supported measurement. Neither figure establishes current performance.
+The latency table recorded roughly 12 µs of added latency in that experiment.
+
+## Recorded numbers (then-main, unmodified server code)
 
 | Metric | Raw PTY | Through mn | Overhead |
 |--------|---------|------------|----------|
@@ -62,8 +69,8 @@ waiting for dd to start. The timer measured `sleep` time, not transfer time.
 - The VecDeque outbound buffer and Packet encode/decode allocations are not bottlenecks
 - **Always verify your benchmark before optimizing**
 
-## Run the benchmark
+## Repeat measurements
 
-```
-cargo test --test latency --release -- --nocapture
-```
+Use the bounded profiling command in [E2E_TESTING.md](E2E_TESTING.md). Record
+the source commit, host, load, and build mode. A new measurement does not
+retroactively validate this table or replace correctness regression tests.
