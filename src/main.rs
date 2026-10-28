@@ -169,7 +169,7 @@ fn live_session_names() -> Vec<String> {
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".lock") {
+        if socket::validate_session_name(&name).is_err() {
             continue;
         }
         // Skip dead sessions so users don't tab-complete to a stale name.
@@ -444,18 +444,12 @@ fn do_create(
     let socket_path = socket::socket_path(name)?;
     let lock_path = socket::lock_path(name)?;
 
-    // Liveness check: a session is alive iff a process holds its lock.
-    // The kernel releases flock on any form of process death, so this
-    // correctly identifies crashed servers without racy sleeps or
-    // PID-reuse hazards.
-    if socket_path.exists() || lock_path.exists() {
-        let stale = socket::is_session_stale(&lock_path);
-        if !stale && !force {
+    // The server alone replaces stale sockets, under the stable lock.
+    if socket::try_probe_lock(&lock_path)?.is_none() {
+        if !force {
             return Err(format!("session '{name}' already exists (use -f to force)").into());
         }
-        // Either stale (safe to clean) or forced. In either case, clean
-        // up both files before the server tries to bind.
-        socket::cleanup_stale_session(&socket_path, &lock_path);
+        do_kill(name, true)?;
     }
 
     let (rows, cols) = get_terminal_size();
@@ -589,37 +583,27 @@ fn do_attach(
 fn session_exists(name: &str) -> Result<bool, Error> {
     let path = socket::socket_path(name)?;
     let lock_path = socket::lock_path(name)?;
-    if !path.exists() && !lock_path.exists() {
-        return Ok(false);
-    }
-    if socket::is_session_stale(&lock_path) {
-        socket::cleanup_stale_session(&path, &lock_path);
-        return Ok(false);
-    }
-    Ok(true)
+    Ok(!socket::cleanup_stale_session(&path, &lock_path)?)
 }
 
 fn do_kill(name: &str, quiet: bool) -> Result<i32, Error> {
     let path = socket::socket_path(name)?;
     let lock_path = socket::lock_path(name)?;
-    let welcome = match query_session(&path) {
-        Ok(w) => w,
-        Err(_) => {
-            // Socket/lock exists but server isn't responding. If the lock
-            // can be acquired, the server is truly dead — clean up.
-            if path.exists() || lock_path.exists() {
-                if socket::is_session_stale(&lock_path) {
-                    socket::cleanup_stale_session(&path, &lock_path);
-                    if !quiet {
-                        eprintln!("mn: {name}: removed stale session");
-                    }
-                    return Ok(0);
-                }
-                return Err(format!("session '{name}' not responding but lock still held").into());
-            }
+    let existed = path.symlink_metadata().is_ok();
+    if socket::cleanup_stale_session(&path, &lock_path)? {
+        if !existed {
             return Err(format!("session '{name}' not found").into());
         }
-    };
+        if !quiet {
+            eprintln!("mn: {name}: removed stale session");
+        }
+        return Ok(0);
+    }
+    let welcome = query_session(&path).map_err(|e| {
+        Error::from(format!(
+            "session '{name}' not responding but lock still held: {e}"
+        ))
+    })?;
 
     // Kill the server process
     let pid = rustix::process::Pid::from_raw(welcome.server_pid as i32)
@@ -636,7 +620,7 @@ fn do_kill(name: &str, quiet: bool) -> Result<i32, Error> {
     // the server is gone. Bounded to ~2s as a safety net.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
-        if socket::is_session_stale(&lock_path) {
+        if socket::cleanup_stale_session(&path, &lock_path)? {
             break;
         }
         if std::time::Instant::now() >= deadline {
@@ -646,9 +630,6 @@ fn do_kill(name: &str, quiet: bool) -> Result<i32, Error> {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-
-    // Remove any leftover files (the server normally cleans these up itself).
-    socket::cleanup_stale_session(&path, &lock_path);
 
     if !quiet {
         eprintln!("mn: {name}: killed");
@@ -677,6 +658,9 @@ fn do_kill_all(quiet: bool) -> Result<i32, Error> {
         }
 
         let name = entry.file_name().to_string_lossy().into_owned();
+        if socket::validate_session_name(&name).is_err() {
+            continue;
+        }
         match do_kill(&name, quiet) {
             Ok(_) => count += 1,
             Err(e) => {
@@ -687,21 +671,7 @@ fn do_kill_all(quiet: bool) -> Result<i32, Error> {
         }
     }
 
-    // Sweep orphan lock files (no paired socket) whose owning server is
-    // gone. This covers servers that died after unlinking the socket but
-    // before unlinking the lock.
-    if let Ok(entries2) = std::fs::read_dir(&dir) {
-        for entry in entries2.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if !name.ends_with(".lock") {
-                continue;
-            }
-            let lock_path = entry.path();
-            if socket::is_session_stale(&lock_path) {
-                let _ = std::fs::remove_file(&lock_path);
-            }
-        }
-    }
+    // Lock inodes are permanent; never sweep them.
 
     if !quiet && count == 0 {
         eprintln!("mn: no sessions to kill");
@@ -734,16 +704,17 @@ fn list_sessions() -> Result<(), Error> {
 
         let name = entry.file_name().to_string_lossy().into_owned();
 
-        // Skip lock files; they're paired with the real socket entries.
-        if name.ends_with(".lock") {
+        if socket::validate_session_name(&name).is_err() {
             continue;
         }
-
         let lock_path = socket::lock_path(&name)?;
-        if socket::is_session_stale(&lock_path) {
-            // Server is dead — clean up both files and skip.
-            socket::cleanup_stale_session(&path, &lock_path);
-            continue;
+        match socket::cleanup_stale_session(&path, &lock_path) {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(e) => {
+                eprintln!("mn: {name}: {e}");
+                continue;
+            }
         }
 
         // Lock is held but query may fail (e.g. server is in
@@ -782,6 +753,8 @@ fn query_session(path: &std::path::Path) -> Result<protocol::Welcome, Error> {
     use std::os::unix::net::UnixStream;
 
     let stream = UnixStream::connect(path)?;
+    socket::verify_peer_uid(&stream)?;
+    stream.set_write_timeout(Some(std::time::Duration::from_secs(2)))?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
 
     let hello = protocol::Hello {

@@ -1,335 +1,400 @@
 use std::io;
-use std::os::fd::OwnedFd;
+#[cfg(target_os = "linux")]
+use std::os::fd::AsFd;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
-use rustix::fs::{self, AtFlags, CWD, Mode, OFlags};
+use rustix::fs::{self, Mode, OFlags};
 
 /// Validate a session name: [a-zA-Z0-9._-], max 64 bytes.
-pub fn validate_session_name(name: &str) -> Result<(), io::Error> {
-    if name.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "session name cannot be empty",
-        ));
-    }
-    if name.len() > 64 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "session name too long (max 64 characters)",
-        ));
-    }
-    if !name
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+pub fn validate_session_name(name: &str) -> io::Result<()> {
+    if name.is_empty()
+        || name.len() > 64
+        || name.starts_with(['.', '-'])
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "session name must contain only alphanumeric characters, dots, underscores, or hyphens",
-        ));
-    }
-    if name.starts_with('.') || name.starts_with('-') {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "session name must not start with '.' or '-'",
+            "session name must be 1–64 alphanumeric, dot, underscore or hyphen characters and must not start with dot or hyphen",
         ));
     }
     Ok(())
 }
 
-/// Resolve the socket directory, creating it if needed.
-/// Order: MNEME_SOCKET_DIR → XDG_RUNTIME_DIR/mneme → ~/.mneme → TMPDIR/mneme/<uid> → /tmp/mneme/<uid>
-pub fn socket_dir() -> Result<PathBuf, io::Error> {
-    let uid = rustix::process::getuid().as_raw();
-
-    let candidates: Vec<(PathBuf, bool, bool)> = vec![
-        // (path, is_personal, is_explicit) — explicit dirs skip permission checks
-        (
-            std::env::var("MNEME_SOCKET_DIR")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map(PathBuf::from)
-                .unwrap_or_default(),
-            true,
-            true, // user explicitly set this — trust it
-        ),
-        (
-            std::env::var("XDG_RUNTIME_DIR")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map(|d| PathBuf::from(d).join("mneme"))
-                .unwrap_or_default(),
-            true,
-            false,
-        ),
-        // macOS: TMPDIR is per-user and cleaned on reboot — correct
-        // place for runtime sockets when XDG_RUNTIME_DIR is unset.
-        (
-            std::env::var("TMPDIR")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map(|d| PathBuf::from(d).join("mneme"))
-                .unwrap_or_default(),
-            true, // TMPDIR on macOS is already per-user (/var/folders/.../T/)
-            false,
-        ),
-        // Last resort: shared /tmp with per-uid subdirectory
-        (PathBuf::from("/tmp/mneme"), false, false),
-    ];
-
-    for (base, personal, explicit) in candidates {
-        if base.as_os_str().is_empty() {
-            continue;
-        }
-
-        if personal {
-            if explicit {
-                // User-provided dir: just ensure it exists and is a directory
-                match ensure_dir_exists(&base) {
-                    Ok(()) => return Ok(base),
-                    Err(_) => continue,
-                }
-            } else {
-                match ensure_safe_dir(&base, uid, Mode::RWXU) {
-                    Ok(()) => return Ok(base),
-                    Err(_) => continue,
-                }
-            }
-        } else {
-            // Shared base + per-uid subdir
-            // Create the shared base with sticky bit (anyone can create subdirs)
-            match ensure_shared_base(&base) {
-                Ok(()) => {}
-                Err(_) => continue,
-            }
-            let user_dir = base.join(uid.to_string());
-            match ensure_safe_dir(&user_dir, uid, Mode::RWXU) {
-                Ok(()) => return Ok(user_dir),
-                Err(_) => continue,
+/// Resolve a private runtime directory. Explicit overrides fail closed.
+/// Parent symlinks (notably /var on macOS) are allowed; leaf symlinks are not.
+pub fn socket_dir() -> io::Result<PathBuf> {
+    let uid = rustix::process::geteuid().as_raw();
+    if let Some(dir) = std::env::var_os("MNEME_SOCKET_DIR").filter(|s| !s.is_empty()) {
+        let path = PathBuf::from(dir);
+        ensure_safe_dir(&path, uid, Mode::RWXU)?;
+        return Ok(path);
+    }
+    for key in ["XDG_RUNTIME_DIR", "TMPDIR"] {
+        if let Some(base) = std::env::var_os(key).filter(|s| !s.is_empty()) {
+            let path = PathBuf::from(base).join("mneme");
+            if ensure_safe_dir(&path, uid, Mode::RWXU).is_ok() {
+                return Ok(path);
             }
         }
     }
-
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "could not find or create socket directory",
-    ))
+    let base = Path::new("/tmp/mneme");
+    ensure_shared_base(base)?;
+    let path = base.join(uid.to_string());
+    ensure_safe_dir(&path, uid, Mode::RWXU)?;
+    Ok(path)
 }
 
-/// Build the full socket path for a session name.
-pub fn socket_path(name: &str) -> Result<PathBuf, io::Error> {
-    let dir = socket_dir()?;
+pub fn socket_path(name: &str) -> io::Result<PathBuf> {
+    validate_session_name(name)?;
+    Ok(socket_dir()?.join(name))
+}
+
+/// Lock inodes are permanent and live in a namespace no valid name can use.
+pub fn lock_path(name: &str) -> io::Result<PathBuf> {
+    lock_path_for_socket(&socket_path(name)?)
+}
+
+pub fn lock_path_for_socket(socket: &Path) -> io::Result<PathBuf> {
+    let name = socket
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| io::Error::other("invalid socket path"))?;
+    validate_session_name(name)?;
+    let parent = socket
+        .parent()
+        .ok_or_else(|| io::Error::other("missing socket directory"))?;
+    let uid = rustix::process::geteuid().as_raw();
+    ensure_safe_dir(parent, uid, Mode::RWXU)?;
+    let dir = parent.join(".locks");
+    ensure_safe_dir(&dir, uid, Mode::RWXU)?;
     Ok(dir.join(name))
 }
 
-/// Build the lock-file path for a session name.
-/// The lock file sits next to the socket and is flocked by the server for
-/// the duration of its lifetime. A session is considered stale iff the
-/// lock is not held by any process.
-pub fn lock_path(name: &str) -> Result<PathBuf, io::Error> {
-    let dir = socket_dir()?;
-    Ok(dir.join(format!("{name}.lock")))
+fn open_lock(path: &Path, create: bool) -> io::Result<OwnedFd> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("missing lock directory"))?;
+    let dir = open_dir_nofollow(parent)?;
+    verify_dir_fd(&dir, rustix::process::geteuid().as_raw())?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| io::Error::other("missing lock name"))?;
+    let flags = OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK;
+    // EXCL distinguishes new files so restrictive umasks can be corrected
+    // without changing permissions of an existing inode.
+    let fd = if create {
+        match fs::openat(
+            &dir,
+            name,
+            flags | OFlags::CREATE | OFlags::EXCL,
+            Mode::RUSR | Mode::WUSR,
+        ) {
+            Ok(fd) => {
+                fs::fchmod(&fd, Mode::RUSR | Mode::WUSR)?;
+                fd
+            }
+            Err(rustix::io::Errno::EXIST) => fs::openat(&dir, name, flags, Mode::empty())?,
+            Err(e) => return Err(e.into()),
+        }
+    } else {
+        fs::openat(&dir, name, flags, Mode::empty())?
+    };
+    let stat = fs::fstat(&fd)?;
+    if fs::FileType::from_raw_mode(stat.st_mode) != fs::FileType::RegularFile
+        || stat.st_uid != rustix::process::geteuid().as_raw()
+        || stat.st_mode & 0o777 != 0o600
+        || stat.st_nlink != 1
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe session lock (expected private, owned regular file with one link)",
+        ));
+    }
+    Ok(fd)
 }
 
-// ---------------------------------------------------------------------------
-// Lock-file operations
-//
-// The server holds an exclusive flock on `<name>.lock` for its entire
-// lifetime. The kernel releases the lock when the process dies (clean
-// exit, SIGKILL, crash, OOM, power loss), so stale detection is reliable
-// without any timeouts or heuristics.
-//
-// We use flock(2) (BSD-style, whole-file, per-open-file-description).
-// It works on macOS and Linux, is cheap, and is released on process
-// death. Unlike fcntl locks, flock state doesn't leak across dup()/fork()
-// weirdness in the same way.
-// ---------------------------------------------------------------------------
-
-/// Try to acquire an exclusive, non-blocking flock on the given path.
-/// Creates the file if it does not exist (mode 0600).
-///
-/// - Ok(Some(fd)) -> lock acquired; caller owns it for as long as they
-///   hold the fd. Dropping the fd releases the lock.
-/// - Ok(None) -> another process holds the lock (session is live).
-/// - Err(e) -> I/O error (permissions, etc).
-pub fn try_acquire_lock(path: &Path) -> io::Result<Option<OwnedFd>> {
-    let fd = fs::open(
-        path,
-        OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    )?;
-
-    // flock is the BSD-style whole-file advisory lock. EX + NB.
-    let ret = unsafe {
-        libc::flock(
-            rustix::fd::AsRawFd::as_raw_fd(&fd),
-            libc::LOCK_EX | libc::LOCK_NB,
-        )
-    };
-    if ret == 0 {
-        Ok(Some(fd))
+fn flock(fd: &OwnedFd, exclusive: bool) -> io::Result<bool> {
+    let kind = if exclusive {
+        libc::LOCK_EX
     } else {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            Ok(None)
-        } else {
-            Err(err)
+        libc::LOCK_SH
+    };
+    if unsafe { libc::flock(fd.as_raw_fd(), kind | libc::LOCK_NB) } == 0 {
+        return Ok(true);
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(false)
+    } else {
+        Err(err)
+    }
+}
+
+/// Both locks, when present, stay held until the operation finishes.
+pub struct SessionLock {
+    current: OwnedFd,
+    _legacy: Option<OwnedFd>,
+}
+
+impl AsRawFd for SessionLock {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.current.as_raw_fd()
+    }
+}
+
+/// Acquire a stable inode exclusively for a server. Never unlink it.
+/// Existing legacy inodes are also held, but never created or removed:
+/// creating them would collide with valid names ending in ".lock".
+pub fn try_acquire_lock(path: &Path) -> io::Result<Option<SessionLock>> {
+    acquire_lock(path, true)
+}
+
+/// Probes and cleaners can coexist. A shared guard excludes every server.
+pub fn try_probe_lock(path: &Path) -> io::Result<Option<SessionLock>> {
+    acquire_lock(path, false)
+}
+
+fn acquire_lock(path: &Path, exclusive: bool) -> io::Result<Option<SessionLock>> {
+    let fd = open_lock(path, true)?;
+    if !flock(&fd, exclusive)? {
+        return Ok(None);
+    }
+    let mut legacy_fd = None;
+    if path.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new(".locks")) {
+        let legacy = path.parent().unwrap().parent().unwrap().join(format!(
+            "{}.lock",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        match std::fs::symlink_metadata(&legacy) {
+            // This can be another valid session, not a pre-upgrade lock.
+            Ok(meta) if meta.file_type().is_socket() => {}
+            Ok(_) => {
+                let old = open_lock(&legacy, false).map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!(
+                            "unsafe legacy lock {}: {e}; inspect it manually",
+                            legacy.display()
+                        ),
+                    )
+                })?;
+                if !flock(&old, exclusive)? {
+                    return Ok(None);
+                }
+                legacy_fd = Some(old);
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
     }
+    Ok(Some(SessionLock {
+        current: fd,
+        _legacy: legacy_fd,
+    }))
 }
 
-/// Check whether a session is stale (no server holding the lock).
-/// Returns true if the session's lock file is absent OR unlockable.
-/// If the lock could be acquired, it is immediately released.
-pub fn is_session_stale(lock_path: &Path) -> bool {
-    // If the lock file doesn't exist, treat as stale (no server to hold it).
-    if !lock_path.exists() {
-        return true;
-    }
-    match try_acquire_lock(lock_path) {
-        Ok(Some(_fd)) => true, // acquired -> no live server; dropped here
-        Ok(None) => false,     // held by someone -> live
-        Err(_) => false,       // unknown -> conservative: treat as live
-    }
+/// A diagnostic only. Destructive operations must acquire their own guard.
+pub fn is_session_stale(path: &Path) -> bool {
+    matches!(try_probe_lock(path), Ok(Some(_)))
 }
 
-/// Clean up a stale session's on-disk state: socket + lock file.
-/// Safe to call when `is_session_stale` returned true, because no live
-/// process can be using either file.
-pub fn cleanup_stale_session(socket_path: &Path, lock_path: &Path) {
-    let _ = std::fs::remove_file(socket_path);
-    let _ = std::fs::remove_file(lock_path);
-}
-
-// ---------------------------------------------------------------------------
-// Safe directory operations using openat/fstat (no TOCTOU)
-// ---------------------------------------------------------------------------
-
-/// Ensure a directory exists (create if needed). No ownership/permission checks.
-/// Used for explicitly user-provided directories (MNEME_SOCKET_DIR).
-fn ensure_dir_exists(path: &Path) -> io::Result<()> {
-    match std::fs::create_dir(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            // Verify it's actually a directory
-            if path.is_dir() {
-                Ok(())
-            } else {
-                Err(io::Error::other("not a directory"))
+/// Remove only an owned Unix socket. Callers must hold the session lock.
+pub fn remove_socket(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta)
+            if meta.file_type().is_socket()
+                && meta.uid() == rustix::process::geteuid().as_raw() =>
+        {
+            match std::fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e),
             }
         }
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "refusing to remove a non-socket or foreign socket",
+        )),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }
 }
 
-/// Ensure a directory exists, is owned by `expected_uid`, and has the
-/// given mode. For the leaf directory: uses open(O_DIRECTORY|O_NOFOLLOW)
-/// + fstat on the opened fd. Parent path components are allowed to be
-///   symlinks (e.g. /var → /private/var on macOS).
+/// Recheck and retain the lock throughout cleanup, not just during a probe.
+/// Returns false if a server owns either the current or a legacy lock.
+pub fn cleanup_stale_session(socket: &Path, lock: &Path) -> io::Result<bool> {
+    let Some(_guard) = try_probe_lock(lock)? else {
+        return Ok(false);
+    };
+    remove_socket(socket)?;
+    Ok(true)
+}
+
+/// Remove this server's socket on all normal/error unwinds, before its lock
+/// is released. Identity checking also protects against same-UID replacement.
+pub struct SocketCleanup {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+impl SocketCleanup {
+    pub fn new(path: &Path) -> io::Result<Self> {
+        let meta = std::fs::symlink_metadata(path)?;
+        Ok(Self {
+            path: path.to_owned(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
+}
+
+impl Drop for SocketCleanup {
+    fn drop(&mut self) {
+        if let Ok(meta) = std::fs::symlink_metadata(&self.path)
+            && meta.dev() == self.dev
+            && meta.ino() == self.ino
+        {
+            let _ = remove_socket(&self.path);
+        }
+    }
+}
+
+/// Authenticate the connected peer before sending any protocol data.
+pub fn verify_peer_uid(stream: &std::os::unix::net::UnixStream) -> io::Result<()> {
+    verify_peer_uid_for(stream, rustix::process::geteuid().as_raw())
+}
+
+fn verify_peer_uid_for(
+    stream: &std::os::unix::net::UnixStream,
+    expected_uid: u32,
+) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    let uid = rustix::net::sockopt::socket_peercred(stream.as_fd())?
+        .uid
+        .as_raw();
+    #[cfg(target_os = "macos")]
+    let uid = {
+        let mut uid = 0;
+        let mut gid = 0;
+        if unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        uid
+    };
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "peer credentials unavailable",
+    ));
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if uid != expected_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "socket peer belongs to another user",
+        ));
+    }
+    Ok(())
+}
+
+fn checked_parent(path: &Path) -> io::Result<PathBuf> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let parent = parent.canonicalize()?;
+    // A writable non-sticky ancestor permits replacing the private directory.
+    // Sticky ancestors are safe only if their owner is trusted.
+    let uid = rustix::process::geteuid().as_raw();
+    for ancestor in parent.ancestors() {
+        let meta = std::fs::metadata(ancestor)?;
+        if (meta.uid() != 0 && meta.uid() != uid)
+            || (meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "unsafe runtime directory ancestor",
+            ));
+        }
+    }
+    Ok(parent.join(
+        path.file_name()
+            .ok_or_else(|| io::Error::other("missing directory name"))?,
+    ))
+}
+
 fn ensure_safe_dir(path: &Path, expected_uid: u32, mode: Mode) -> io::Result<()> {
-    // Resolve symlinks in parent components, keep the leaf unresolved
-    let canonical = match path.parent() {
-        Some(parent) if parent != Path::new("") => {
-            let resolved_parent = parent.canonicalize()?;
-            resolved_parent.join(path.file_name().unwrap())
+    let path = checked_parent(path)?;
+    match fs::mkdir(&path, mode) {
+        Ok(()) => {
+            let fd = open_dir_nofollow(&path)?;
+            fs::fchmod(&fd, mode)?;
         }
-        _ => path.to_path_buf(),
-    };
-
-    // Try to create (ignore AlreadyExists)
-    match fs::mkdir(&canonical, mode) {
-        Ok(()) => {}
         Err(rustix::io::Errno::EXIST) => {}
         Err(e) => return Err(e.into()),
     }
-
-    // Open the leaf directory with O_NOFOLLOW — refuses symlinks
-    let fd = open_dir_nofollow(&canonical)?;
-
-    // Verify ownership and permissions via fstat on the opened fd
-    verify_dir_fd(&fd, expected_uid)?;
-
-    Ok(())
+    verify_dir_fd(&open_dir_nofollow(&path)?, expected_uid)
 }
 
-/// Create a shared base directory (e.g. /tmp/mneme) with sticky bit.
-/// We don't verify ownership since it's shared — but we do verify it's
-/// a real directory (not a symlink).
 fn ensure_shared_base(path: &Path) -> io::Result<()> {
-    // Resolve symlinks in parent components
-    let canonical = match path.parent() {
-        Some(parent) if parent != Path::new("") => {
-            let resolved_parent = parent.canonicalize()?;
-            resolved_parent.join(path.file_name().unwrap())
-        }
-        _ => path.to_path_buf(),
-    };
-
-    // 1777 = rwxrwxrwx + sticky bit
+    let path = checked_parent(path)?;
     let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO | Mode::SVTX;
-    match fs::mkdir(&canonical, mode) {
-        Ok(()) => {}
+    match fs::mkdir(&path, mode) {
+        Ok(()) => fs::fchmod(open_dir_nofollow(&path)?, mode)?,
         Err(rustix::io::Errno::EXIST) => {}
         Err(e) => return Err(e.into()),
     }
-
-    let stat = fs::statat(CWD, &canonical, AtFlags::SYMLINK_NOFOLLOW)?;
-    let file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
-    if file_type != rustix::fs::FileType::Directory {
-        return Err(io::Error::other("not a directory"));
+    let stat = fs::fstat(open_dir_nofollow(&path)?)?;
+    let uid = rustix::process::geteuid().as_raw();
+    if (stat.st_uid != 0 && stat.st_uid != uid) || stat.st_mode & 0o1000 == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe shared runtime directory",
+        ));
     }
-
     Ok(())
 }
 
-/// Open a directory with O_NOFOLLOW | O_DIRECTORY. This refuses to
-/// follow symlinks and fails if the path isn't a directory.
 fn open_dir_nofollow(path: &Path) -> io::Result<OwnedFd> {
-    let fd = fs::open(
+    Ok(fs::open(
         path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
-    )?;
-    Ok(fd)
+    )?)
 }
 
-/// Verify a directory fd is owned by the expected uid and has no
-/// group/other access (0700).
 fn verify_dir_fd(fd: &OwnedFd, expected_uid: u32) -> io::Result<()> {
     let stat = fs::fstat(fd)?;
-
-    // Must be a directory
-    let file_type = rustix::fs::FileType::from_raw_mode(stat.st_mode);
-    if file_type != rustix::fs::FileType::Directory {
-        return Err(io::Error::other("not a directory"));
-    }
-
-    // Must be owned by us
-    if stat.st_uid != expected_uid {
+    if fs::FileType::from_raw_mode(stat.st_mode) != fs::FileType::Directory
+        || stat.st_uid != expected_uid
+        || stat.st_mode & 0o777 != 0o700
+    {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "directory not owned by current user",
+            "runtime directory must be owned by current user with mode 0700",
         ));
     }
-
-    // Must have no group/other access
-    let perms = stat.st_mode & 0o777;
-    if perms & 0o077 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "directory has insecure permissions",
-        ));
-    }
-
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authenticates_real_peer_credentials() {
+        let (stream, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        verify_peer_uid(&stream).unwrap();
+        let other_uid = rustix::process::geteuid().as_raw().wrapping_add(1);
+        assert_eq!(
+            verify_peer_uid_for(&stream, other_uid).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
 
     #[test]
     fn valid_session_names() {

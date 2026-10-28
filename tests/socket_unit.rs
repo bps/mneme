@@ -28,7 +28,10 @@ impl DirGuard {
         // SAFETY: env mutation is serialized by holding the global mutex
         // for the entire lifetime of the guard.
         let lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let td = tempfile::TempDir::new().expect("tempdir");
+        let td = tempfile::Builder::new()
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .tempdir()
+            .expect("tempdir");
         let prev = std::env::var_os("MNEME_SOCKET_DIR");
         unsafe {
             std::env::set_var("MNEME_SOCKET_DIR", td.path());
@@ -78,7 +81,6 @@ fn try_acquire_lock_creates_file_and_returns_fd() {
     assert!(path.exists(), "lock file should be created");
 
     drop(fd);
-    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -104,7 +106,6 @@ fn try_acquire_lock_second_call_returns_none_while_held() {
         "lock should be re-acquirable after release"
     );
     drop(third);
-    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -120,7 +121,6 @@ fn try_acquire_lock_drop_releases() {
 
     let after = socket::try_acquire_lock(&path).unwrap();
     assert!(after.is_some(), "drop should release flock");
-    let _ = std::fs::remove_file(&path);
 }
 
 // ---------------------------------------------------------------------------
@@ -143,12 +143,11 @@ fn is_session_stale_when_lock_unheld() {
     let _g = DirGuard::new();
     let path = socket::lock_path("stale-unheld").unwrap();
     // Plant an unheld lock file.
-    std::fs::write(&path, b"").unwrap();
+    drop(socket::try_acquire_lock(&path).unwrap().unwrap());
     assert!(
         socket::is_session_stale(&path),
         "unheld lock file should be reported stale"
     );
-    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -163,7 +162,6 @@ fn is_session_stale_returns_false_when_held() {
     );
 
     drop(_held);
-    let _ = std::fs::remove_file(&path);
 }
 
 // ---------------------------------------------------------------------------
@@ -171,18 +169,18 @@ fn is_session_stale_returns_false_when_held() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn cleanup_stale_session_removes_both_files() {
+fn cleanup_stale_session_removes_socket_and_preserves_lock() {
     let _g = DirGuard::new();
     let sock = socket::socket_path("cleanup-1").unwrap();
     let lock = socket::lock_path("cleanup-1").unwrap();
-    std::fs::write(&sock, b"").unwrap();
-    std::fs::write(&lock, b"").unwrap();
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    drop(socket::try_acquire_lock(&lock).unwrap().unwrap());
     assert!(sock.exists() && lock.exists());
 
-    socket::cleanup_stale_session(&sock, &lock);
+    assert!(socket::cleanup_stale_session(&sock, &lock).unwrap());
 
     assert!(!sock.exists(), "socket should be gone");
-    assert!(!lock.exists(), "lock should be gone");
+    assert!(lock.exists(), "stable lock must remain");
 }
 
 #[test]
@@ -192,15 +190,15 @@ fn cleanup_stale_session_is_idempotent() {
     let lock = socket::lock_path("cleanup-2").unwrap();
 
     // Files don't exist — must not panic.
-    socket::cleanup_stale_session(&sock, &lock);
+    assert!(socket::cleanup_stale_session(&sock, &lock).unwrap());
 
     // Create just the lock — only one file present is fine.
-    std::fs::write(&lock, b"").unwrap();
-    socket::cleanup_stale_session(&sock, &lock);
-    assert!(!lock.exists());
+    drop(socket::try_acquire_lock(&lock).unwrap().unwrap());
+    assert!(socket::cleanup_stale_session(&sock, &lock).unwrap());
+    assert!(lock.exists());
 
-    // Call again on already-gone files — still fine.
-    socket::cleanup_stale_session(&sock, &lock);
+    // Call again with the same stable inode — still fine.
+    assert!(socket::cleanup_stale_session(&sock, &lock).unwrap());
 }
 
 // ---------------------------------------------------------------------------
@@ -208,13 +206,13 @@ fn cleanup_stale_session_is_idempotent() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn socket_path_and_lock_path_share_directory() {
+fn lock_namespace_is_hidden_and_separate() {
     let _g = DirGuard::new();
     let s = socket::socket_path("share-1").unwrap();
     let l = socket::lock_path("share-1").unwrap();
-    assert_eq!(s.parent(), l.parent());
+    assert_eq!(s.parent().unwrap().join(".locks"), l.parent().unwrap());
     assert_eq!(s.file_name().unwrap(), "share-1");
-    assert_eq!(l.file_name().unwrap(), "share-1.lock");
+    assert_eq!(l.file_name().unwrap(), "share-1");
 }
 
 #[test]

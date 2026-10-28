@@ -264,27 +264,28 @@ fn run_server_inner(
     }
 
     // Acquire the session lock BEFORE binding — kernel releases on death.
-    let lock_path = opts.socket_path.with_file_name(format!(
-        "{}.lock",
-        opts.socket_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| format!("invalid socket path: {}", opts.socket_path.display()))?
-    ));
-    let _lock_fd = match crate::socket::try_acquire_lock(&lock_path)? {
-        Some(fd) => fd,
-        None => {
+    let lock_path = crate::socket::lock_path_for_socket(&opts.socket_path)?;
+    // Discovery probes also use flock. Allow brief probes to finish.
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    let _lock_fd = loop {
+        if let Some(fd) = crate::socket::try_acquire_lock(&lock_path)? {
+            break fd;
+        }
+        if std::time::Instant::now() >= deadline {
             return Err(format!(
                 "another server already holds the session lock: {}",
                 lock_path.display()
             )
             .into());
         }
+        std::thread::sleep(Duration::from_millis(10));
     };
 
     // Bind + listen BEFORE spawning the child — fail early.
     let std_listener = bind_listen(&opts.socket_path)
         .map_err(|e| format!("bind {}: {e}", opts.socket_path.display()))?;
+    // Reverse declaration order drops socket cleanup before the lock.
+    let _socket_cleanup = crate::socket::SocketCleanup::new(&opts.socket_path)?;
     std_listener.set_nonblocking(true)?;
 
     // Open PTY and set initial size.
@@ -342,8 +343,6 @@ fn run_server_inner(
         result.and(cleanup)
     })?;
 
-    let _ = std::fs::remove_file(&opts.socket_path);
-    let _ = std::fs::remove_file(&lock_path);
     eprintln!("[mn-srv] exit clean");
     Ok(())
 }
@@ -353,9 +352,8 @@ fn run_server_inner(
 // ---------------------------------------------------------------------------
 
 fn bind_listen(path: &std::path::Path) -> io::Result<std::os::unix::net::UnixListener> {
-    if path.exists() {
-        std::fs::remove_file(path)?;
-    }
+    // Caller holds the session lock.
+    crate::socket::remove_socket(path)?;
     let listener = std::os::unix::net::UnixListener::bind(path)?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;

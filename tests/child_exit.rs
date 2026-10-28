@@ -21,7 +21,10 @@ fn mn_bin() -> std::path::PathBuf {
 // ---------------------------------------------------------------------------
 
 fn start_session(prefix: &str, shell_cmd: &str) -> (TempDir, String, u32) {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = tempfile::Builder::new()
+        .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .tempdir()
+        .expect("tempdir");
     let session = format!("{prefix}-{}", std::process::id());
 
     let output = Command::new(mn_bin())
@@ -278,7 +281,10 @@ fn exited_session_attachable_multiple_times() {
 #[test]
 fn fast_exit_with_create_attach() {
     // mn -c fast /usr/bin/true — the design's fast-exit scenario
-    let dir = TempDir::new().expect("tempdir");
+    let dir = tempfile::Builder::new()
+        .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .tempdir()
+        .expect("tempdir");
     let session = format!("fast-c-{}", std::process::id());
 
     let output = Command::new(mn_bin())
@@ -304,7 +310,10 @@ fn fast_exit_with_create_attach() {
 
 #[test]
 fn fast_exit_nonzero_with_create_attach() {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = tempfile::Builder::new()
+        .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .tempdir()
+        .expect("tempdir");
     let session = format!("fast-c-nz-{}", std::process::id());
 
     let output = Command::new(mn_bin())

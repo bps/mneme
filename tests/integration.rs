@@ -33,7 +33,10 @@ struct TestEnv {
 impl TestEnv {
     fn new() -> Self {
         Self {
-            dir: TempDir::new().expect("failed to create temp dir"),
+            dir: tempfile::Builder::new()
+                .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .tempdir()
+                .expect("failed to create temp dir"),
         }
     }
 
@@ -550,7 +553,7 @@ fn create_after_server_killed_recovers() {
 
     // Socket and lock files should still be on disk (no one cleaned up).
     let sock = env.socket_dir().join(&sess);
-    let lock = env.socket_dir().join(format!("{sess}.lock"));
+    let lock = env.socket_dir().join(".locks").join(&sess);
     assert!(sock.exists(), "socket should remain after SIGKILL");
     assert!(lock.exists(), "lock file should remain after SIGKILL");
 
@@ -593,15 +596,21 @@ fn create_against_live_session_still_fails() {
 }
 
 /// An orphan lock file (regular file only, no socket) with no holder
-/// should be treated as stale and cleaned up on create.
+/// can be reused on create without replacing its inode.
 #[test]
-fn orphan_lock_file_is_cleaned() {
+fn orphan_lock_file_is_reused() {
     let env = TestEnv::new();
     let sess = env.session("orphan-lock");
 
     // Plant an orphan lock file — regular file, no one holds flock on it.
-    let lock = env.socket_dir().join(format!("{sess}.lock"));
-    std::fs::write(&lock, b"").expect("write lock file");
+    let lock = env.socket_dir().join(".locks").join(&sess);
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    std::fs::set_permissions(
+        lock.parent().unwrap(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    drop(mneme::socket::try_acquire_lock(&lock).unwrap().unwrap());
     assert!(lock.exists());
 
     // Creating should succeed — no conflicting live server.
@@ -610,7 +619,7 @@ fn orphan_lock_file_is_cleaned() {
 }
 
 /// After normal session termination (child exits, last client detaches),
-/// both socket and lock files should be removed.
+/// the socket is removed but the stable lock inode remains.
 #[test]
 fn files_cleaned_after_clean_exit() {
     let env = TestEnv::new();
@@ -626,14 +635,14 @@ fn files_cleaned_after_clean_exit() {
     let _ = env.run(&["kill", &sess], 5);
 
     let sock = env.socket_dir().join(&sess);
-    let lock = env.socket_dir().join(format!("{sess}.lock"));
+    let lock = env.socket_dir().join(".locks").join(&sess);
     // Give the server a moment to complete its cleanup.
     for _ in 0..20 {
-        if !sock.exists() && !lock.exists() {
+        if !sock.exists() {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(!sock.exists(), "socket file not cleaned up after kill");
-    assert!(!lock.exists(), "lock file not cleaned up after kill");
+    assert!(lock.exists(), "stable lock must remain after kill");
 }

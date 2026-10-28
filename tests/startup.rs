@@ -14,7 +14,12 @@ struct Env(TempDir);
 
 impl Env {
     fn new() -> Self {
-        Self(TempDir::new().unwrap())
+        Self(
+            tempfile::Builder::new()
+                .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .tempdir()
+                .unwrap(),
+        )
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -128,7 +133,7 @@ fn zero_ring_sizes_are_rejected_before_startup() {
             &["new", "-s", size, "startup", "/usr/bin/true"],
             "ring size must be between",
         );
-        assert!(!env.0.path().join("startup.lock").exists());
+        assert!(!env.0.path().join(".locks/startup").exists());
     }
 }
 
@@ -155,7 +160,7 @@ fn sizes_larger_than_protocol_capacity_are_rejected() {
         err.contains("ring size must be between") || err.contains("invalid size"),
         "{err}"
     );
-    assert!(!env.0.path().join("startup.lock").exists());
+    assert!(!env.0.path().join(".locks/startup").exists());
 }
 
 #[test]
