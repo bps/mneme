@@ -12,13 +12,13 @@
 //! - Controller handoff + ResizeReq works end-to-end
 
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec};
-use tempfile::TempDir;
+mod common;
+use common::{ChildGuard, start_session as create_session};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -70,6 +70,7 @@ fn open_pty() -> (OwnedFd, OwnedFd) {
     let follower = unsafe { OwnedFd::from_raw_fd(follower) };
     // Prevent leader from leaking into child processes
     rustix::io::fcntl_setfd(&leader, rustix::io::FdFlags::CLOEXEC).unwrap();
+    rustix::io::fcntl_setfd(&follower, rustix::io::FdFlags::CLOEXEC).unwrap();
     (leader, follower)
 }
 
@@ -90,63 +91,11 @@ fn set_winsize(fd: &OwnedFd, rows: u16, cols: u16) {
 // Session helpers
 // ---------------------------------------------------------------------------
 
-/// Create a new session (server + child) using `mn new`.
-/// Returns (TempDir, session_name, server_pid).
-fn create_session(prefix: &str, shell_cmd: &str) -> (TempDir, String, u32) {
-    let dir = tempfile::Builder::new()
-        .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
-        .tempdir()
-        .expect("tempdir");
-    let session = format!("{prefix}-{}", std::process::id());
-
-    let output = Command::new(mn_bin())
-        .env("MNEME_SOCKET_DIR", dir.path())
-        .args(["new", &session, "/bin/sh", "-c", shell_cmd])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("spawn");
-    assert!(
-        output.status.success(),
-        "mn new failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    std::thread::sleep(Duration::from_millis(300));
-
-    let socket = dir.path().join(&session);
-    let pid = query_pid(&socket).expect("could not query server PID");
-    (dir, session, pid)
-}
-
-fn query_pid(socket: &Path) -> Option<u32> {
-    let s = UnixStream::connect(socket).ok()?;
-    s.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
-    let hello = mneme::protocol::Hello {
-        version: mneme::protocol::PROTOCOL_VERSION,
-        intent: mneme::protocol::Intent::Query,
-        flags: mneme::protocol::ClientFlags::empty(),
-        rows: 0,
-        cols: 0,
-    };
-    mneme::protocol::send_packet(s.as_fd(), &mneme::protocol::Packet::hello(&hello)).ok()?;
-    let pkt = mneme::protocol::recv_packet(s.as_fd()).ok()?;
-    pkt.parse_welcome().map(|w| w.server_pid)
-}
-
 /// Return the shell command that runs the resize probe.
 fn probe_cmd() -> String {
     let probe =
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/helpers/resize_probe.py");
     format!("python3 {}", probe.display())
-}
-
-fn kill_server(pid: u32) {
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGKILL);
-    }
-    std::thread::sleep(Duration::from_millis(100));
 }
 
 // ---------------------------------------------------------------------------
@@ -162,7 +111,7 @@ fn kill_server(pid: u32) {
 /// process group (`tcsetpgrp`).  This means `TIOCSWINSZ` on the leader
 /// will produce a kernel-generated `SIGWINCH` to the client — exactly
 /// as a real terminal emulator would.
-fn spawn_mn_attach(socket_dir: &Path, session: &str, follower: OwnedFd) -> Child {
+fn spawn_mn_attach(socket_dir: &Path, session: &str, follower: OwnedFd) -> ChildGuard {
     use std::os::unix::process::CommandExt;
 
     let follower_file = std::fs::File::from(follower);
@@ -192,7 +141,7 @@ fn spawn_mn_attach(socket_dir: &Path, session: &str, follower: OwnedFd) -> Child
         });
     }
 
-    cmd.spawn().expect("failed to spawn mn attach")
+    ChildGuard(cmd.spawn().expect("failed to spawn mn attach"))
 }
 
 // ---------------------------------------------------------------------------
@@ -334,38 +283,10 @@ impl PtyReader {
 
 /// Attach a raw protocol client (not via PTY harness). Drains through
 /// ReplayEnd to reach Live state.
-fn attach_raw_client(socket: &Path, flags: mneme::protocol::ClientFlags) -> UnixStream {
-    let s = UnixStream::connect(socket).expect("connect");
-    s.set_read_timeout(Some(Duration::from_secs(5))).ok();
-
-    let hello = mneme::protocol::Hello {
-        version: mneme::protocol::PROTOCOL_VERSION,
-        intent: mneme::protocol::Intent::Attach,
-        flags,
-        rows: 24,
-        cols: 80,
-    };
-    mneme::protocol::send_packet(s.as_fd(), &mneme::protocol::Packet::hello(&hello)).unwrap();
-
-    // Drain through Welcome + Replay* + ReplayEnd
-    loop {
-        let pkt = mneme::protocol::recv_packet(s.as_fd()).unwrap();
-        if pkt.msg_type == mneme::protocol::MsgType::ReplayEnd {
-            break;
-        }
-    }
-    s
-}
+use common::attach_live as attach_raw_client;
 
 /// Read packets with a timeout, returning all received.
-fn drain_packets(s: &UnixStream, timeout: Duration) -> Vec<mneme::protocol::Packet> {
-    s.set_read_timeout(Some(timeout)).ok();
-    let mut packets = Vec::new();
-    while let Ok(pkt) = mneme::protocol::recv_packet(s.as_fd()) {
-        packets.push(pkt);
-    }
-    packets
-}
+use common::drain_packets;
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -375,7 +296,7 @@ fn drain_packets(s: &UnixStream, timeout: Duration) -> Vec<mneme::protocol::Pack
 /// verify the child sees the new dimensions.
 #[test]
 fn e2e_resize_basic() {
-    let (dir, session, server_pid) = create_session("e2e-basic", &probe_cmd());
+    let (dir, session, _server_pid) = create_session("e2e-basic", &probe_cmd());
 
     let (leader, follower) = open_pty();
     set_winsize(&leader, 24, 80);
@@ -402,13 +323,13 @@ fn e2e_resize_basic() {
 
     let _ = child.kill();
     let _ = child.wait();
-    kill_server(server_pid);
+    dir.shutdown(&session);
 }
 
 /// Multiple sequential resizes all propagate correctly.
 #[test]
 fn e2e_resize_multiple() {
-    let (dir, session, server_pid) = create_session("e2e-multi", &probe_cmd());
+    let (dir, session, _server_pid) = create_session("e2e-multi", &probe_cmd());
 
     let (leader, follower) = open_pty();
     set_winsize(&leader, 24, 80);
@@ -436,13 +357,13 @@ fn e2e_resize_multiple() {
 
     let _ = child.kill();
     let _ = child.wait();
-    kill_server(server_pid);
+    dir.shutdown(&session);
 }
 
 /// Detach, reattach, and verify resize still works in the new session.
 #[test]
 fn e2e_detach_reattach_resize() {
-    let (dir, session, server_pid) = create_session("e2e-reattach", &probe_cmd());
+    let (dir, session, _server_pid) = create_session("e2e-reattach", &probe_cmd());
 
     // --- First attachment ---
     let (leader1, follower1) = open_pty();
@@ -489,8 +410,8 @@ fn e2e_detach_reattach_resize() {
         }
     }
 
-    // Small delay for the server to notice the detach
-    std::thread::sleep(Duration::from_millis(300));
+    // Wait until the server has processed the detach before reattaching.
+    common::wait_for_client_count(&dir.path().join(&session), 0);
 
     // --- Second attachment ---
     let (leader2, follower2) = open_pty();
@@ -516,7 +437,7 @@ fn e2e_detach_reattach_resize() {
 
     let _ = child2.kill();
     let _ = child2.wait();
-    kill_server(server_pid);
+    dir.shutdown(&session);
 }
 
 /// Controller handoff: when a second client takes control and then detaches,
@@ -524,7 +445,7 @@ fn e2e_detach_reattach_resize() {
 /// its terminal dimensions.
 #[test]
 fn e2e_resize_controller_handoff() {
-    let (dir, session, server_pid) = create_session("e2e-handoff", &probe_cmd());
+    let (dir, session, _server_pid) = create_session("e2e-handoff", &probe_cmd());
     let socket = dir.path().join(&session);
 
     // --- Client A: PTY harness (initial controller) ---
@@ -591,7 +512,7 @@ fn e2e_resize_controller_handoff() {
 
     let _ = child_a.kill();
     let _ = child_a.wait();
-    kill_server(server_pid);
+    dir.shutdown(&session);
 }
 
 /// Server killed mid-attach: client should detect the hangup and exit
@@ -599,7 +520,7 @@ fn e2e_resize_controller_handoff() {
 /// path in `client_mainloop` and the `IoError(..)` branch in `do_attach`.
 #[test]
 fn e2e_attach_exits_on_server_hangup() {
-    let (dir, session, server_pid) =
+    let (dir, session, _server_pid) =
         create_session("e2e-hangup", "/bin/sh -c 'echo READY; sleep 60'");
 
     let (leader, follower) = open_pty();
@@ -615,7 +536,7 @@ fn e2e_attach_exits_on_server_hangup() {
     );
 
     // Yank the server out from under the attached client.
-    kill_server(server_pid);
+    dir.crash(&session);
 
     // Drain PTY output during the wait so the client doesn't block on
     // stdout writes (e.g. the "I/O error" message + cursor restore).

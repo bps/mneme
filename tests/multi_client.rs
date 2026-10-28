@@ -8,101 +8,16 @@ use std::io::Write;
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use tempfile::TempDir;
-
-fn mn_bin() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_BIN_EXE_mn"))
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn start_session(prefix: &str, shell_cmd: &str) -> (TempDir, String, u32) {
-    let dir = tempfile::Builder::new()
-        .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
-        .tempdir()
-        .expect("tempdir");
-    let session = format!("{prefix}-{}", std::process::id());
-
-    let output = Command::new(mn_bin())
-        .env("MNEME_SOCKET_DIR", dir.path())
-        .args(["new", &session, "/bin/sh", "-c", shell_cmd])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("spawn");
-    assert!(
-        output.status.success(),
-        "create failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    std::thread::sleep(Duration::from_millis(300));
-
-    let socket = dir.path().join(&session);
-    let pid = query_pid(&socket).expect("query PID");
-    (dir, session, pid)
-}
-
-fn query_pid(socket: &Path) -> Option<u32> {
-    let s = UnixStream::connect(socket).ok()?;
-    s.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
-    let hello = mneme::protocol::Hello {
-        version: mneme::protocol::PROTOCOL_VERSION,
-        intent: mneme::protocol::Intent::Query,
-        flags: mneme::protocol::ClientFlags::empty(),
-        rows: 0,
-        cols: 0,
-    };
-    mneme::protocol::send_packet(s.as_fd(), &mneme::protocol::Packet::hello(&hello)).ok()?;
-    let pkt = mneme::protocol::recv_packet(s.as_fd()).ok()?;
-    pkt.parse_welcome().map(|w| w.server_pid)
-}
+mod common;
+use common::start_session;
 
 /// Attach a raw client with given flags. Drains through ReplayEnd to reach Live state.
-fn attach_live(socket: &Path, flags: mneme::protocol::ClientFlags) -> UnixStream {
-    let s = UnixStream::connect(socket).expect("connect");
-    s.set_read_timeout(Some(Duration::from_secs(5))).ok();
-
-    let hello = mneme::protocol::Hello {
-        version: mneme::protocol::PROTOCOL_VERSION,
-        intent: mneme::protocol::Intent::Attach,
-        flags,
-        rows: 24,
-        cols: 80,
-    };
-    mneme::protocol::send_packet(s.as_fd(), &mneme::protocol::Packet::hello(&hello)).unwrap();
-
-    // Drain Welcome + Replay* + ReplayEnd
-    loop {
-        let pkt = mneme::protocol::recv_packet(s.as_fd()).unwrap();
-        if pkt.msg_type == mneme::protocol::MsgType::ReplayEnd {
-            break;
-        }
-    }
-    s
-}
+use common::attach_live;
 
 /// Read packets from a stream until timeout, returning all received.
-fn drain_packets(s: &UnixStream, timeout: Duration) -> Vec<mneme::protocol::Packet> {
-    s.set_read_timeout(Some(timeout)).ok();
-    let mut packets = Vec::new();
-    while let Ok(pkt) = mneme::protocol::recv_packet(s.as_fd()) {
-        packets.push(pkt);
-    }
-    packets
-}
-
-fn kill_server(pid: u32) {
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGKILL);
-    }
-    std::thread::sleep(Duration::from_millis(100));
-}
+use common::drain_packets;
 
 /// Return the shell command that runs the resize probe.
 fn probe_cmd() -> String {
@@ -230,7 +145,7 @@ fn both_clients_receive_pty_output() {
     }
 
     let cmd = format!("cat {fifo}; sleep 60");
-    let (dir, session, pid) = start_session("both-recv", &cmd);
+    let (dir, session, _pid) = start_session("both-recv", &cmd);
     let socket = dir.path().join(&session);
 
     let flags = mneme::protocol::ClientFlags::empty();
@@ -277,7 +192,7 @@ fn both_clients_receive_pty_output() {
     drop(c1);
     drop(c2);
     let _ = std::fs::remove_file(&fifo);
-    kill_server(pid);
+    dir.shutdown(&session);
 }
 
 #[test]
@@ -292,7 +207,7 @@ fn readonly_client_input_ignored() {
     }
 
     let cmd = format!("cat {fifo}; sleep 60");
-    let (dir, session, pid) = start_session("readonly", &cmd);
+    let (dir, session, _pid) = start_session("readonly", &cmd);
     let socket = dir.path().join(&session);
 
     // Attach a readonly client
@@ -337,12 +252,12 @@ fn readonly_client_input_ignored() {
     drop(ro);
     drop(normal);
     let _ = std::fs::remove_file(&fifo);
-    kill_server(pid);
+    dir.shutdown(&session);
 }
 
 #[test]
 fn controller_detach_sends_resize_req() {
-    let (dir, session, pid) = start_session("resize-req", "sleep 60");
+    let (dir, session, _pid) = start_session("resize-req", "sleep 60");
     let socket = dir.path().join(&session);
 
     // Attach client A (becomes controller)
@@ -359,7 +274,7 @@ fn controller_detach_sends_resize_req() {
     .unwrap();
     drop(b);
 
-    std::thread::sleep(Duration::from_millis(300));
+    common::wait_for_client_count(&socket, 1);
 
     // Read from A — should get a ResizeReq
     let pkts = drain_packets(&a, Duration::from_millis(500));
@@ -373,12 +288,12 @@ fn controller_detach_sends_resize_req() {
     );
 
     drop(a);
-    kill_server(pid);
+    dir.shutdown(&session);
 }
 
 #[test]
 fn readonly_client_does_not_become_controller() {
-    let (dir, session, pid) = start_session("ro-no-ctrl", "sleep 60");
+    let (dir, session, _pid) = start_session("ro-no-ctrl", "sleep 60");
     let socket = dir.path().join(&session);
 
     // Attach normal client (controller)
@@ -395,7 +310,7 @@ fn readonly_client_does_not_become_controller() {
     .unwrap();
     drop(normal);
 
-    std::thread::sleep(Duration::from_millis(300));
+    common::wait_for_client_count(&socket, 1);
 
     let pkts = drain_packets(&ro, Duration::from_millis(500));
     let has_resize_req = pkts
@@ -408,12 +323,12 @@ fn readonly_client_does_not_become_controller() {
     );
 
     drop(ro);
-    kill_server(pid);
+    dir.shutdown(&session);
 }
 
 #[test]
 fn low_priority_client_does_not_become_controller() {
-    let (dir, session, pid) = start_session("lp-no-ctrl", "sleep 60");
+    let (dir, session, _pid) = start_session("lp-no-ctrl", "sleep 60");
     let socket = dir.path().join(&session);
 
     let normal = attach_live(&socket, mneme::protocol::ClientFlags::empty());
@@ -427,7 +342,7 @@ fn low_priority_client_does_not_become_controller() {
     .unwrap();
     drop(normal);
 
-    std::thread::sleep(Duration::from_millis(300));
+    common::wait_for_client_count(&socket, 1);
 
     let pkts = drain_packets(&lp, Duration::from_millis(500));
     let has_resize_req = pkts
@@ -440,12 +355,12 @@ fn low_priority_client_does_not_become_controller() {
     );
 
     drop(lp);
-    kill_server(pid);
+    dir.shutdown(&session);
 }
 
 #[test]
 fn three_clients_controller_handoff_chain() {
-    let (dir, session, pid) = start_session("chain", "sleep 60");
+    let (dir, session, _pid) = start_session("chain", "sleep 60");
     let socket = dir.path().join(&session);
 
     let flags = mneme::protocol::ClientFlags::empty();
@@ -474,7 +389,7 @@ fn three_clients_controller_handoff_chain() {
     )
     .unwrap();
     drop(c);
-    std::thread::sleep(Duration::from_millis(300));
+    common::wait_for_client_count(&socket, 2);
 
     let pkts_b = drain_packets(&b, Duration::from_millis(500));
     assert!(
@@ -499,7 +414,7 @@ fn three_clients_controller_handoff_chain() {
     )
     .unwrap();
     drop(b);
-    std::thread::sleep(Duration::from_millis(300));
+    common::wait_for_client_count(&socket, 1);
 
     let pkts_a2 = drain_packets(&a, Duration::from_millis(500));
     assert!(
@@ -510,7 +425,7 @@ fn three_clients_controller_handoff_chain() {
     );
 
     drop(a);
-    kill_server(pid);
+    dir.shutdown(&session);
 }
 
 // ---------------------------------------------------------------------------
@@ -521,7 +436,7 @@ fn three_clients_controller_handoff_chain() {
 /// dimensions (the server calls tcsetwinsize + SIGWINCH on the child).
 #[test]
 fn controller_resize_changes_pty() {
-    let (dir, session, pid) = start_session("resize-pty", &probe_cmd());
+    let (dir, session, _pid) = start_session("resize-pty", &probe_cmd());
     let socket = dir.path().join(&session);
 
     let (a, replay) = attach_live_with_replay(&socket, mneme::protocol::ClientFlags::empty());
@@ -556,14 +471,14 @@ fn controller_resize_changes_pty() {
     );
 
     drop(a);
-    kill_server(pid);
+    dir.shutdown(&session);
 }
 
 /// Verify that a Resize from a non-controlling client is silently ignored
 /// (the PTY dimensions do not change and no SIGWINCH is sent).
 #[test]
 fn non_controller_resize_ignored() {
-    let (dir, session, pid) = start_session("resize-noctl", &probe_cmd());
+    let (dir, session, _pid) = start_session("resize-noctl", &probe_cmd());
     let socket = dir.path().join(&session);
 
     // A attaches first (becomes controller)
@@ -624,7 +539,7 @@ fn non_controller_resize_ignored() {
 
     drop(a);
     drop(b);
-    kill_server(pid);
+    dir.shutdown(&session);
 }
 
 /// Verify that a Resize sent while the client is still in Replaying state
@@ -640,7 +555,7 @@ fn resize_during_replay_ignored() {
         "dd if=/dev/urandom bs=1024 count=10 2>/dev/null | base64; exec python3 {}",
         probe.display()
     );
-    let (dir, session, pid) = start_session("replay-resize", &cmd);
+    let (dir, session, _pid) = start_session("replay-resize", &cmd);
     let socket = dir.path().join(&session);
 
     // Wait for the output to be produced and stored in the ring buffer
@@ -696,13 +611,13 @@ fn resize_during_replay_ignored() {
     );
 
     drop(s);
-    kill_server(pid);
+    dir.shutdown(&session);
 }
 
 /// Verify that a Resize from a readonly client is silently ignored.
 #[test]
 fn readonly_resize_ignored() {
-    let (dir, session, pid) = start_session("ro-resize", &probe_cmd());
+    let (dir, session, _pid) = start_session("ro-resize", &probe_cmd());
     let socket = dir.path().join(&session);
 
     // Attach a normal client (becomes controller)
@@ -737,5 +652,5 @@ fn readonly_resize_ignored() {
 
     drop(ro);
     drop(normal);
-    kill_server(pid);
+    dir.shutdown(&session);
 }

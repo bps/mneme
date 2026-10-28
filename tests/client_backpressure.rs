@@ -4,7 +4,10 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+
+mod common;
+use common::ChildGuard;
 use std::time::{Duration, Instant};
 
 use mneme::protocol::{HEADER_SIZE, MAX_PAYLOAD, MsgType, PROTOCOL_VERSION, Packet, Welcome};
@@ -13,15 +16,11 @@ use tempfile::TempDir;
 
 const WAIT: Duration = Duration::from_secs(5);
 
-fn until(mut ready: impl FnMut() -> bool) {
-    let deadline = Instant::now() + WAIT;
-    while !ready() {
-        assert!(Instant::now() < deadline, "deadline expired");
-        std::thread::sleep(Duration::from_millis(5));
-    }
+fn until(ready: impl FnMut() -> bool) {
+    assert!(common::wait_for(WAIT, ready), "deadline expired");
 }
 
-struct Client(Child);
+struct Client(ChildGuard);
 
 impl Client {
     fn wait(&mut self) -> ExitStatus {
@@ -34,15 +33,6 @@ impl Client {
     }
 }
 
-impl Drop for Client {
-    fn drop(&mut self) {
-        if self.0.try_wait().unwrap().is_none() {
-            let _ = self.0.kill();
-        }
-        let _ = self.0.wait();
-    }
-}
-
 struct Peer {
     dir: TempDir,
     listener: UnixListener,
@@ -51,10 +41,7 @@ struct Peer {
 
 impl Peer {
     fn new() -> Self {
-        let dir = tempfile::Builder::new()
-            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
-            .tempdir()
-            .unwrap();
+        let dir = common::private_dir();
         let path = dir.path().join("client");
         let lock = try_acquire_lock(&lock_path_for_socket(&path).unwrap())
             .unwrap()
@@ -69,7 +56,7 @@ impl Peer {
     }
 
     fn spawn(&self, stdin: Stdio, stdout: Stdio) -> (Client, UnixStream) {
-        let client = Client(
+        let client = Client(ChildGuard(
             Command::new(env!("CARGO_BIN_EXE_mn"))
                 .env("MNEME_SOCKET_DIR", self.dir.path())
                 .env_remove("MNEME_DEBUG")
@@ -80,7 +67,7 @@ impl Peer {
                 .stderr(Stdio::null())
                 .spawn()
                 .unwrap(),
-        );
+        ));
         let mut accepted = None;
         until(|| {
             match self.listener.accept() {

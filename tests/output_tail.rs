@@ -12,20 +12,8 @@ use tempfile::TempDir;
 const LIMIT: Duration = Duration::from_secs(12);
 const BLOCKS: usize = 256;
 
-// Unlike the fd protocol helper, do not retry partial-packet EAGAIN forever.
-fn recv_packet(mut stream: &UnixStream) -> std::io::Result<Packet> {
-    let mut header = [0; protocol::HEADER_SIZE];
-    stream.read_exact(&mut header)?;
-    let kind =
-        MsgType::from_u8(header[0]).ok_or_else(|| std::io::Error::other("unknown packet type"))?;
-    let len = u16::from_le_bytes([header[1], header[2]]) as usize;
-    if len > protocol::MAX_PAYLOAD {
-        return Err(std::io::Error::other("oversized packet"));
-    }
-    let mut payload = vec![0; len];
-    stream.read_exact(&mut payload)?;
-    Ok(Packet::new(kind, payload))
-}
+mod common;
+use common::recv_packet;
 
 struct Session {
     child: Child,
@@ -34,10 +22,7 @@ struct Session {
 
 impl Session {
     fn start(script: &str) -> Self {
-        let dir = tempfile::Builder::new()
-            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
-            .tempdir()
-            .unwrap();
+        let dir = common::private_dir();
         let (mut ready, notify) = UnixStream::pair().unwrap();
         ready.set_read_timeout(Some(LIMIT)).unwrap();
         let fd = notify.as_raw_fd();

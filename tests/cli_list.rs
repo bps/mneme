@@ -3,132 +3,13 @@
 //! - sort order
 //! - status indicators: `*` (clients attached), `+` (child exited), ` ` (idle)
 
-use std::io::{Read, Write};
+mod common;
+
+use common::{Env, wait_for};
+use std::io::Write;
 use std::os::fd::AsFd;
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
-
-use tempfile::TempDir;
-
-fn mn_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_mn"))
-}
-
-static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-struct Env {
-    dir: TempDir,
-}
-
-impl Env {
-    fn new() -> Self {
-        Self {
-            dir: tempfile::Builder::new()
-                .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
-                .tempdir()
-                .unwrap(),
-        }
-    }
-    fn dir(&self) -> &Path {
-        self.dir.path()
-    }
-    fn session(&self, prefix: &str) -> String {
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        format!("{prefix}-{}-{n}", std::process::id())
-    }
-    fn cmd(&self) -> Command {
-        let mut c = Command::new(mn_bin());
-        c.env("MNEME_SOCKET_DIR", self.dir());
-        c
-    }
-    fn run(&self, args: &[&str], timeout: u64) -> (i32, String, String) {
-        let mut child = self
-            .cmd()
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn");
-        wait_with_timeout(&mut child, Duration::from_secs(timeout))
-    }
-    fn server_pid(&self, session: &str) -> Option<u32> {
-        let path = self.dir().join(session);
-        let stream = UnixStream::connect(&path).ok()?;
-        stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
-        let hello = mneme::protocol::Hello {
-            version: mneme::protocol::PROTOCOL_VERSION,
-            intent: mneme::protocol::Intent::Query,
-            flags: mneme::protocol::ClientFlags::empty(),
-            rows: 0,
-            cols: 0,
-        };
-        mneme::protocol::send_packet(stream.as_fd(), &mneme::protocol::Packet::hello(&hello))
-            .ok()?;
-        let pkt = mneme::protocol::recv_packet(stream.as_fd()).ok()?;
-        Some(pkt.parse_welcome()?.server_pid)
-    }
-}
-
-impl Drop for Env {
-    fn drop(&mut self) {
-        if let Ok(entries) = std::fs::read_dir(self.dir()) {
-            let mut pids = Vec::new();
-            for e in entries.flatten() {
-                let name = e.file_name().to_string_lossy().to_string();
-                if let Some(pid) = self.server_pid(&name) {
-                    pids.push(pid);
-                }
-            }
-            for pid in pids {
-                unsafe {
-                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                }
-            }
-        }
-    }
-}
-
-fn wait_with_timeout(child: &mut Child, timeout: Duration) -> (i32, String, String) {
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait().expect("try_wait") {
-            Some(status) => {
-                let mut out = String::new();
-                let mut err = String::new();
-                if let Some(mut s) = child.stdout.take() {
-                    s.read_to_string(&mut out).ok();
-                }
-                if let Some(mut s) = child.stderr.take() {
-                    s.read_to_string(&mut err).ok();
-                }
-                return (status.code().unwrap_or(-1), out, err);
-            }
-            None => {
-                if start.elapsed() > timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    panic!("mn timed out");
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
-}
-
-fn wait_for<F: Fn() -> bool>(timeout: Duration, f: F) -> bool {
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        if f() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    f()
-}
 
 // ---------------------------------------------------------------------------
 
@@ -245,9 +126,8 @@ fn list_marks_attached_session_with_star() {
         .expect("set timeout");
     let _welcome = mneme::protocol::recv_packet(stream.as_fd()).expect("welcome");
 
-    // Give the server a moment for the client_count to be reflected in
-    // subsequent Query Welcomes.
-    std::thread::sleep(Duration::from_millis(150));
+    // Observe registration before asserting the CLI's attached marker.
+    common::wait_for_client_count(&path, 1);
 
     let (code, out, _) = env.run(&["list"], 5);
     assert_eq!(code, 0);

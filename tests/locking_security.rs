@@ -1,10 +1,12 @@
 //! Lock identity, upgrade compatibility, force ordering and filesystem safety.
-use std::io;
 use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
+
+mod common;
+use common::private_dir;
 use std::sync::{Arc, Barrier, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -13,13 +15,6 @@ use mneme::{protocol, socket};
 // fork temporarily inherits CLOEXEC descriptors until exec. Serialize this
 // binary's tests so subprocess launches cannot prolong another test's lock.
 static TEST_LOCK: Mutex<()> = Mutex::new(());
-
-fn private_dir() -> tempfile::TempDir {
-    tempfile::Builder::new()
-        .permissions(std::fs::Permissions::from_mode(0o700))
-        .tempdir()
-        .unwrap()
-}
 
 fn lock(dir: &Path, name: &str) -> std::path::PathBuf {
     socket::lock_path_for_socket(&dir.join(name)).unwrap()
@@ -34,99 +29,18 @@ fn cmd(dir: &Path) -> Command {
     cmd
 }
 
-// Drain both pipes while the direct child runs. A descendant can retain a
-// writer after the child exits, so EOF is not a completion condition.
-fn read_available(
-    reader: &mut impl io::Read,
-    output: &mut Vec<u8>,
-    deadline: Instant,
-) -> io::Result<()> {
-    let mut buffer = [0; 4096];
-    loop {
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "output collection deadline exceeded",
-            ));
-        }
-        match reader.read(&mut buffer) {
-            Ok(0) => return Ok(()),
-            Ok(n) => output.extend_from_slice(&buffer[..n]),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-}
-
 fn wait(child: &mut Child) -> Output {
-    let deadline = Instant::now() + Duration::from_secs(8);
-    let mut stdout_pipe = child.stdout.take().unwrap();
-    let mut stderr_pipe = child.stderr.take().unwrap();
-    for fd in [stdout_pipe.as_fd(), stderr_pipe.as_fd()] {
-        let flags = rustix::fs::fcntl_getfl(fd).unwrap();
-        rustix::fs::fcntl_setfl(fd, flags | rustix::fs::OFlags::NONBLOCK).unwrap();
-    }
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    loop {
-        let result = (|| {
-            read_available(&mut stdout_pipe, &mut stdout, deadline)?;
-            read_available(&mut stderr_pipe, &mut stderr, deadline)?;
-            let status = child.try_wait()?;
-            if status.is_some() {
-                // All writes from the direct child are now buffered. Collect
-                // them, but do not wait for EOF from unrelated inherited copies.
-                read_available(&mut stdout_pipe, &mut stdout, deadline)?;
-                read_available(&mut stderr_pipe, &mut stderr, deadline)?;
-            }
-            Ok::<_, io::Error>(status)
-        })();
-        match result {
-            Ok(Some(status)) => {
-                return Output {
-                    status,
-                    stdout,
-                    stderr,
-                };
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("subprocess collection failed: {e}");
-            }
-        }
-    }
+    common::collect_output(child, Duration::from_secs(8))
 }
 
-fn until(mut predicate: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !predicate() {
-        assert!(Instant::now() < deadline, "condition deadline exceeded");
-        std::thread::sleep(Duration::from_millis(10));
-    }
+fn until(predicate: impl FnMut() -> bool) {
+    assert!(
+        common::wait_for(Duration::from_secs(5), predicate),
+        "condition deadline exceeded"
+    );
 }
 
-fn query(path: &Path) -> io::Result<protocol::Welcome> {
-    let stream = UnixStream::connect(path)?;
-    socket::verify_peer_uid(&stream)?;
-    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
-    stream.set_write_timeout(Some(Duration::from_millis(500)))?;
-    protocol::send_packet(
-        stream.as_fd(),
-        &protocol::Packet::hello(&protocol::Hello {
-            version: protocol::PROTOCOL_VERSION,
-            intent: protocol::Intent::Query,
-            flags: protocol::ClientFlags::empty(),
-            rows: 0,
-            cols: 0,
-        }),
-    )?;
-    protocol::recv_packet(stream.as_fd())?
-        .parse_welcome()
-        .ok_or_else(|| io::Error::other("expected Welcome"))
-}
+use common::query;
 
 #[test]
 fn stale_probe_does_not_authorize_later_cleanup() {

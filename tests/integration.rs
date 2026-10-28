@@ -4,15 +4,14 @@
 //! temp dir, so tests can run in parallel without interfering with each
 //! other or the user's real sessions.
 
-use std::io::{Read, Write};
-use std::os::fd::AsFd;
-use std::os::unix::net::UnixStream;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use tempfile::TempDir;
+mod common;
+use common::{ChildGuard, RuntimeDir};
 
 // ---------------------------------------------------------------------------
 // Test harness
@@ -27,16 +26,13 @@ static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 /// Isolated test environment with its own socket directory.
 /// On drop, kills all server processes and removes the dir.
 struct TestEnv {
-    dir: TempDir,
+    dir: RuntimeDir,
 }
 
 impl TestEnv {
     fn new() -> Self {
         Self {
-            dir: tempfile::Builder::new()
-                .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
-                .tempdir()
-                .expect("failed to create temp dir"),
+            dir: RuntimeDir::new(),
         }
     }
 
@@ -80,7 +76,7 @@ impl TestEnv {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let mut child = cmd.spawn().expect("failed to spawn mn");
+        let mut child = ChildGuard(cmd.spawn().expect("failed to spawn mn"));
 
         if let Some(input) = stdin_bytes
             && let Some(mut stdin) = child.stdin.take()
@@ -93,78 +89,23 @@ impl TestEnv {
     }
 
     /// Spawn mn as a background process (for interactive tests).
-    fn spawn(&self, args: &[&str]) -> Child {
-        self.cmd()
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("failed to spawn mn")
+    fn spawn(&self, args: &[&str]) -> ChildGuard {
+        ChildGuard(
+            self.cmd()
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("failed to spawn mn"),
+        )
     }
 
     /// Query a session's server PID by connecting to its socket.
     fn server_pid(&self, session: &str) -> Option<u32> {
-        let path = self.socket_dir().join(session);
-        let stream = UnixStream::connect(&path).ok()?;
-        stream.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
-
-        // Send a Query Hello
-        let hello = mneme::protocol::Hello {
-            version: mneme::protocol::PROTOCOL_VERSION,
-            intent: mneme::protocol::Intent::Query,
-            flags: mneme::protocol::ClientFlags::empty(),
-            rows: 0,
-            cols: 0,
-        };
-        mneme::protocol::send_packet(stream.as_fd(), &mneme::protocol::Packet::hello(&hello))
-            .ok()?;
-
-        let pkt = mneme::protocol::recv_packet(stream.as_fd()).ok()?;
-        let welcome = pkt.parse_welcome()?;
-        Some(welcome.server_pid)
-    }
-
-    /// Kill all servers with sockets in our directory.
-    fn kill_all_servers(&self) {
-        // Discover current PIDs
-        let entries = match std::fs::read_dir(self.socket_dir()) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        let mut pids = Vec::new();
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if let Some(pid) = self.server_pid(&name) {
-                pids.push(pid);
-            }
-        }
-        if pids.is_empty() {
-            return;
-        }
-        // SIGKILL everything immediately — no graceful shutdown in tests
-        for &pid in &pids {
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGKILL);
-            }
-        }
-        // Wait for them to die
-        let start = std::time::Instant::now();
-        while start.elapsed() < Duration::from_secs(2) {
-            let any_alive = pids
-                .iter()
-                .any(|&pid| unsafe { libc::kill(pid as libc::pid_t, 0) == 0 });
-            if !any_alive {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-}
-
-impl Drop for TestEnv {
-    fn drop(&mut self) {
-        self.kill_all_servers();
+        common::query(&self.socket_dir().join(session))
+            .ok()
+            .map(|w| w.server_pid)
     }
 }
 
@@ -177,46 +118,11 @@ struct CmdResult {
 
 /// Wait for a child to exit, with timeout. Kills on timeout.
 fn collect_output(child: &mut Child, timeout: Duration) -> CmdResult {
-    let start = std::time::Instant::now();
-    let poll_interval = Duration::from_millis(50);
-
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut stdout = Vec::new();
-                let mut stderr = Vec::new();
-                if let Some(mut out) = child.stdout.take() {
-                    out.read_to_end(&mut stdout).ok();
-                }
-                if let Some(mut err) = child.stderr.take() {
-                    err.read_to_end(&mut stderr).ok();
-                }
-                return CmdResult {
-                    code: status.code().unwrap_or(-1),
-                    stdout: String::from_utf8_lossy(&stdout).to_string(),
-                    stderr: String::from_utf8_lossy(&stderr).to_string(),
-                };
-            }
-            Ok(None) => {
-                if start.elapsed() > timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return CmdResult {
-                        code: -1,
-                        stdout: String::new(),
-                        stderr: "TIMEOUT".into(),
-                    };
-                }
-                std::thread::sleep(poll_interval);
-            }
-            Err(_) => {
-                return CmdResult {
-                    code: -1,
-                    stdout: String::new(),
-                    stderr: "wait error".into(),
-                };
-            }
-        }
+    let output = common::collect_output(child, timeout);
+    CmdResult {
+        code: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
     }
 }
 
