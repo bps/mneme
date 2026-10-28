@@ -25,10 +25,11 @@
 //!    forwards them as `ControlMsg::Input/Resize/Detach{id, ...}`. On
 //!    EOF or error, sends `ControlMsg::ClientGone{id}`.
 //!
-//! Backpressure: PTY fan-out only sends to *Live* clients. The bounded
-//! per-client outbound channel means a slow client makes the main task
-//! `await` on `send`, which stalls the PTY read loop and ultimately the
-//! child — same semantics as the original poll-based server.
+//! Backpressure: PTY fan-out queues output for every registered client,
+//! including clients still replaying their snapshot. The bounded per-client
+//! outbound channel means a slow client makes the main task `await` on `send`,
+//! which stalls the PTY read loop and ultimately the child. Replay must finish
+//! before the writer drains queued output; no post-snapshot bytes are skipped.
 
 use crate::protocol::{
     self, ClientFlags, HEADER_SIZE, Hello, Intent, MAX_PAYLOAD, MsgType, PROTOCOL_VERSION, Packet,
@@ -401,7 +402,7 @@ fn spawn_child(command: &[String], follower_fd: OwnedFd) -> io::Result<tokio::pr
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClientState {
     Replaying, // writer hasn't finished sending the snapshot yet
-    Live,      // bidirectional; included in PTY fan-out
+    Live,      // replay finished; eligible to become resize controller
 }
 
 #[derive(Debug)]
@@ -481,10 +482,10 @@ async fn mainloop(
             break;
         }
 
-        // PTY readability is only "interesting" while child is running.
-        // To avoid duck-finding #4 (replay clients shouldn't gate PTY),
-        // we always read PTY when child is alive; fan-out only goes to
-        // Live clients.
+        // Every registered client receives post-snapshot PTY output, even
+        // during replay. A full outbound queue stalls PTY reads rather than
+        // dropping bytes; the writer can drain without mainloop processing
+        // its ClientLive event.
         tokio::select! {
             biased;
 
@@ -538,21 +539,7 @@ async fn mainloop(
                         }
                         ring.write(data);
 
-                        // Fan out to Live clients (chunked to MAX_PAYLOAD).
-                        // Backpressure: if a Live client's bounded mpsc is
-                        // full, this `await` blocks the PTY read loop.
-                        // That stalls the child via the kernel PTY buffer.
-                        for chunk in data.chunks(MAX_PAYLOAD) {
-                            let pkt = Packet::content(chunk);
-                            for c in &clients {
-                                if c.state == ClientState::Live
-                                    && c.out_tx.send(OutMsg::Packet(pkt.clone())).await.is_err()
-                                {
-                                    // writer task gone; will be cleaned
-                                    // up via ClientGone shortly.
-                                }
-                            }
-                        }
+                        fan_out(&clients, data).await;
                     }
                     Ok(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => {}
                     Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
@@ -605,6 +592,8 @@ async fn mainloop(
                 match msg {
                     ControlMsg::Register { stream, hello } => {
                         let id = next_id; next_id += 1;
+                        // Snapshot and registration have no intervening await:
+                        // subsequent PTY bytes go into this client's queue.
                         let snapshot = ring.snapshot();
                         let (out_tx, out_rx) = mpsc::channel::<OutMsg>(OUTBOUND_CAP);
                         let (read_half, write_half) = stream.into_split();
@@ -658,6 +647,18 @@ async fn mainloop(
     }
 
     Ok(())
+}
+
+async fn fan_out(clients: &[ClientHandle], data: &[u8]) {
+    for chunk in data.chunks(MAX_PAYLOAD) {
+        let pkt = Packet::content(chunk);
+        for c in clients {
+            // Include replaying clients. Their writer sends ReplayEnd before
+            // draining this bounded queue. If it fills, stall PTY reads.
+            // A closed channel is cleaned up via ClientGone.
+            let _ = c.out_tx.send(OutMsg::Packet(pkt.clone())).await;
+        }
+    }
 }
 
 async fn write_pty(leader: &AsyncFd<OwnedFd>, mut buf: &[u8]) {
@@ -806,7 +807,8 @@ async fn writer_task(
         let _ = ctrl_tx.send(ControlMsg::ClientGone { id });
         return;
     }
-    // 2. Notify main: client is Live.
+    // 2. Notify main: client is Live. Do not wait for an acknowledgment:
+    // mainloop may be blocked sending post-snapshot output to our full queue.
     if ctrl_tx.send(ControlMsg::ClientLive { id }).is_err() {
         return;
     }
@@ -956,5 +958,246 @@ mod startup_tests {
             assert!(!socket.exists());
             assert!(!dir.path().join("startup.lock").exists());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::{Future, poll_fn};
+    use std::pin::Pin;
+    use std::task::Poll;
+    use tokio::sync::oneshot;
+
+    async fn poll_once<F: Future>(mut future: Pin<&mut F>) -> Poll<F::Output> {
+        poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await
+    }
+
+    fn client(id: u64, state: ClientState, out_tx: mpsc::Sender<OutMsg>) -> ClientHandle {
+        ClientHandle {
+            id,
+            flags: ClientFlags::empty(),
+            state,
+            is_controller: false,
+            out_tx,
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_replay_queues_ordered_output_with_bounded_backpressure() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let (server, mut peer) = tokio::net::UnixStream::pair().unwrap();
+            rustix::net::sockopt::set_socket_send_buffer_size(&server, 4096).unwrap();
+            server.writable().await.unwrap();
+            let (_read, write) = server.into_split();
+            let snapshot: Vec<u8> = (0..1024 * 1024).map(|i| (i % 251) as u8).collect();
+            let (out_tx, out_rx) = mpsc::channel(OUTBOUND_CAP);
+            let (live_tx, mut live_rx) = mpsc::channel(OUTBOUND_CAP);
+            let clients = vec![
+                client(1, ClientState::Replaying, out_tx.clone()),
+                client(2, ClientState::Live, live_tx),
+            ];
+            let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
+            // Disable cooperative yields only in this test, so Pending means
+            // socket/channel backpressure rather than an exhausted task budget.
+            let mut writer = Box::pin(tokio::task::unconstrained(writer_task(
+                1,
+                write,
+                snapshot.clone(),
+                out_rx,
+                ctrl_tx,
+            )));
+
+            // No peer reads yet: replay cannot finish. Keep the writer parked
+            // while a separately gated producer emits post-snapshot output.
+            assert!(poll_once(writer.as_mut()).await.is_pending());
+            assert!(matches!(
+                ctrl_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            let expected: Vec<u8> = (0..OUTBOUND_CAP * 2 + 3)
+                .flat_map(|i| {
+                    let mut chunk = vec![b'.'; MAX_PAYLOAD];
+                    let marker = format!("SEQ:{i:04}:");
+                    chunk[..marker.len()].copy_from_slice(marker.as_bytes());
+                    chunk
+                })
+                .collect();
+            let (release, gate) = oneshot::channel();
+            let mut producer = Box::pin(tokio::task::unconstrained(async {
+                gate.await.unwrap();
+                fan_out(&clients, &expected).await;
+                for c in &clients {
+                    c.out_tx.send(OutMsg::Shutdown).await.unwrap();
+                }
+            }));
+            assert!(poll_once(producer.as_mut()).await.is_pending());
+            assert_eq!(out_tx.capacity(), OUTBOUND_CAP);
+            release.send(()).unwrap();
+            assert!(poll_once(producer.as_mut()).await.is_pending());
+            // The 65th packet is blocked, not dropped or buffered elsewhere.
+            assert_eq!(out_tx.capacity(), 0);
+            assert_eq!(clients[1].out_tx.capacity(), 0);
+            assert!(matches!(
+                ctrl_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+
+            let receive = async {
+                let mut replay = Vec::new();
+                let mut content = Vec::new();
+                let mut replay_ended = false;
+                loop {
+                    let pkt = match recv_packet(&mut peer).await {
+                        Ok(pkt) => pkt,
+                        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                        Err(e) => panic!("read failed: {e}"),
+                    };
+                    match pkt.msg_type {
+                        MsgType::Replay => {
+                            assert!(!replay_ended, "Replay after ReplayEnd");
+                            replay.extend_from_slice(&pkt.payload);
+                        }
+                        MsgType::ReplayEnd => {
+                            assert!(!replay_ended, "duplicate ReplayEnd");
+                            replay_ended = true;
+                        }
+                        MsgType::Content => {
+                            assert!(replay_ended, "Content before ReplayEnd");
+                            content.extend_from_slice(&pkt.payload);
+                        }
+                        other => panic!("unexpected packet: {other:?}"),
+                    }
+                }
+                assert!(replay_ended);
+                assert_eq!(replay, snapshot);
+                assert_eq!(content, expected);
+            };
+            let receive_live = async {
+                let mut content = Vec::new();
+                while let Some(msg) = live_rx.recv().await {
+                    match msg {
+                        OutMsg::Packet(pkt) => {
+                            assert_eq!(pkt.msg_type, MsgType::Content);
+                            content.extend_from_slice(&pkt.payload);
+                        }
+                        OutMsg::Shutdown => break,
+                    }
+                }
+                assert_eq!(content, expected);
+            };
+            // Deliberately do not process ClientLive. Queue draining must
+            // progress even while mainloop is blocked inside fan_out.
+            tokio::join!(writer, producer, receive, receive_live);
+            assert!(matches!(
+                ctrl_rx.recv().await,
+                Some(ControlMsg::ClientLive { id: 1 })
+            ));
+            assert!(matches!(
+                ctrl_rx.recv().await,
+                Some(ControlMsg::ClientGone { id: 1 })
+            ));
+        })
+        .await
+        .expect("blocked replay did not resume before deadline");
+    }
+
+    #[tokio::test]
+    async fn disconnected_replay_releases_backpressure_for_other_clients() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (server, peer) = tokio::net::UnixStream::pair().unwrap();
+            rustix::net::sockopt::set_socket_send_buffer_size(&server, 4096).unwrap();
+            server.writable().await.unwrap();
+            let (_read, write) = server.into_split();
+            let (out_tx, out_rx) = mpsc::channel(OUTBOUND_CAP);
+            let (live_tx, mut live_rx) = mpsc::channel(OUTBOUND_CAP);
+            let clients = vec![
+                client(1, ClientState::Replaying, out_tx.clone()),
+                client(2, ClientState::Live, live_tx),
+            ];
+            let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
+            let mut writer = Box::pin(tokio::task::unconstrained(writer_task(
+                1,
+                write,
+                vec![b'R'; 1024 * 1024],
+                out_rx,
+                ctrl_tx,
+            )));
+            assert!(poll_once(writer.as_mut()).await.is_pending());
+            let expected: Vec<u8> = (0..OUTBOUND_CAP + 2)
+                .flat_map(|i| {
+                    let mut chunk = vec![b'.'; MAX_PAYLOAD];
+                    let marker = format!("SEQ:{i:04}:");
+                    chunk[..marker.len()].copy_from_slice(marker.as_bytes());
+                    chunk
+                })
+                .collect();
+            let mut producer = Box::pin(tokio::task::unconstrained(async {
+                fan_out(&clients, &expected).await;
+                clients[1].out_tx.send(OutMsg::Shutdown).await.unwrap();
+            }));
+            assert!(poll_once(producer.as_mut()).await.is_pending());
+            assert_eq!(out_tx.capacity(), 0);
+
+            // A replay write failure must drop its receiver and unblock the
+            // pending send, even before mainloop processes ClientGone.
+            drop(peer);
+            let receive_live = async {
+                let mut content = Vec::new();
+                while let Some(msg) = live_rx.recv().await {
+                    match msg {
+                        OutMsg::Packet(pkt) => {
+                            assert_eq!(pkt.msg_type, MsgType::Content);
+                            content.extend_from_slice(&pkt.payload);
+                        }
+                        OutMsg::Shutdown => break,
+                    }
+                }
+                assert_eq!(content, expected);
+            };
+            tokio::join!(writer, producer, receive_live);
+            assert!(out_tx.is_closed());
+            assert!(matches!(
+                ctrl_rx.recv().await,
+                Some(ControlMsg::ClientGone { id: 1 })
+            ));
+            assert!(ctrl_rx.recv().await.is_none());
+        })
+        .await
+        .expect("disconnected replay did not release backpressure before deadline");
+    }
+
+    #[tokio::test]
+    async fn output_queued_before_live_event_is_processed_follows_empty_replay() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (server, mut peer) = tokio::net::UnixStream::pair().unwrap();
+            let (_read, write) = server.into_split();
+            let (out_tx, out_rx) = mpsc::channel(OUTBOUND_CAP);
+            let clients = vec![client(1, ClientState::Replaying, out_tx)];
+            let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
+            let writer = tokio::spawn(writer_task(1, write, Vec::new(), out_rx, ctrl_tx));
+            // ReplayEnd is on the wire, but mainloop has not handled ClientLive.
+            assert_eq!(
+                recv_packet(&mut peer).await.unwrap().msg_type,
+                MsgType::ReplayEnd
+            );
+            assert!(matches!(
+                ctrl_rx.recv().await,
+                Some(ControlMsg::ClientLive { id: 1 })
+            ));
+            assert_eq!(clients[0].state, ClientState::Replaying);
+            fan_out(&clients, b"SEQ:0000:SEQ:0001:").await;
+            clients[0].out_tx.send(OutMsg::Shutdown).await.unwrap();
+            writer.await.unwrap();
+            let pkt = recv_packet(&mut peer).await.unwrap();
+            assert_eq!(pkt.msg_type, MsgType::Content);
+            assert_eq!(pkt.payload, b"SEQ:0000:SEQ:0001:");
+            assert_eq!(
+                recv_packet(&mut peer).await.unwrap_err().kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+        })
+        .await
+        .expect("empty replay handoff did not complete before deadline");
     }
 }
