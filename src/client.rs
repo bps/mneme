@@ -17,18 +17,16 @@
 //! O_NONBLOCK on inherited stdio is restored in `NonblockGuard::drop` so
 //! the parent shell isn't left in nonblocking mode.
 
-use crate::protocol::{
-    self, ClientFlags, HEADER_SIZE, Intent, MAX_PAYLOAD, MsgType, PROTOCOL_VERSION, Packet,
-};
+use crate::protocol::{self, ClientFlags, Intent, MAX_PAYLOAD, MsgType, PROTOCOL_VERSION, Packet};
 
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::Path;
 
+use tokio::io::AsyncWriteExt;
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::signal::unix::{SignalKind, signal};
@@ -496,7 +494,7 @@ async fn client_mainloop(
 
 async fn server_reader_task(mut r: OwnedReadHalf, tx: mpsc::Sender<ServerEvent>) {
     loop {
-        let pkt = match recv_packet_half(&mut r).await {
+        let pkt = match protocol::recv_packet_async(&mut r).await {
             Ok(p) => p,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                 let _ = tx.send(ServerEvent::HungUp).await;
@@ -528,8 +526,7 @@ async fn server_reader_task(mut r: OwnedReadHalf, tx: mpsc::Sender<ServerEvent>)
 
 async fn server_writer_task(mut w: OwnedWriteHalf, mut rx: mpsc::Receiver<Packet>) {
     while let Some(pkt) = rx.recv().await {
-        let buf = pkt.encode();
-        if w.write_all(&buf).await.is_err() {
+        if protocol::send_packet_async(&mut w, &pkt).await.is_err() {
             return;
         }
     }
@@ -593,25 +590,6 @@ async fn write_stdout(
             Err(_) => continue,
         }
     }
-}
-
-async fn recv_packet_half(r: &mut OwnedReadHalf) -> io::Result<Packet> {
-    let mut header = [0u8; HEADER_SIZE];
-    r.read_exact(&mut header).await?;
-    let msg_type = MsgType::from_u8(header[0])
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown message type"))?;
-    let len = u16::from_le_bytes([header[1], header[2]]) as usize;
-    if len > MAX_PAYLOAD {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "payload too large",
-        ));
-    }
-    let mut payload = vec![0u8; len];
-    if len > 0 {
-        r.read_exact(&mut payload).await?;
-    }
-    Ok(Packet::new(msg_type, payload))
 }
 
 /// Build the CSI u (kitty keyboard protocol) encoding for a Ctrl-key press.

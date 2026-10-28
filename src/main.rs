@@ -1,9 +1,8 @@
 mod client;
-mod protocol;
-mod ring;
 mod server;
-mod socket;
 mod startup;
+
+use mneme::{protocol, ring, socket};
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::CompleteEnv;

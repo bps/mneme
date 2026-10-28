@@ -32,7 +32,8 @@
 //! finish before the writer drains queued output; no post-snapshot bytes are skipped.
 
 use crate::protocol::{
-    self, ClientFlags, HEADER_SIZE, Hello, Intent, MAX_PAYLOAD, MsgType, PROTOCOL_VERSION, Packet,
+    self, ClientFlags, Hello, Intent, MAX_PAYLOAD, MsgType, PROTOCOL_VERSION, Packet,
+    recv_packet_async as recv_packet, send_packet_async as send_packet,
 };
 use crate::ring::RingBuffer;
 
@@ -43,7 +44,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
+use tokio::io::{AsyncWriteExt, Interest};
 use tokio::net::UnixListener;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Notify, mpsc};
@@ -1105,14 +1106,14 @@ async fn writer_task(
     if !snapshot.is_empty() {
         for chunk in snapshot.chunks(MAX_PAYLOAD) {
             let pkt = Packet::replay(chunk);
-            if write_pkt(&mut w, &pkt).await.is_err() {
+            if send_packet(&mut w, &pkt).await.is_err() {
                 ok = false;
                 break;
             }
         }
     }
     if ok
-        && write_pkt(&mut w, &Packet::empty(MsgType::ReplayEnd))
+        && send_packet(&mut w, &Packet::empty(MsgType::ReplayEnd))
             .await
             .is_err()
     {
@@ -1136,7 +1137,7 @@ async fn writer_task(
         capacity_changed.notify_one();
         match msg {
             OutMsg::Packet(p) => {
-                if write_pkt(&mut w, &p).await.is_err() {
+                if send_packet(&mut w, &p).await.is_err() {
                     drop(rx);
                     capacity_changed.notify_one();
                     let _ = ctrl_tx.send(ControlMsg::ClientGone { id });
@@ -1168,7 +1169,7 @@ async fn reader_task(
 ) {
     let readonly = flags.contains(ClientFlags::READONLY);
     loop {
-        let pkt = match recv_packet_half(&mut r).await {
+        let pkt = match recv_packet(&mut r).await {
             Ok(p) => p,
             Err(_) => break,
         };
@@ -1198,59 +1199,6 @@ async fn reader_task(
         }
     }
     let _ = ctrl_tx.send(ControlMsg::ClientGone { id });
-}
-
-// ---------------------------------------------------------------------------
-// Async packet I/O helpers (cancellation-safe variants are NOT provided —
-// callers must own their stream and not race these inside select!).
-// ---------------------------------------------------------------------------
-
-async fn send_packet(stream: &mut tokio::net::UnixStream, pkt: &Packet) -> io::Result<()> {
-    let buf = pkt.encode();
-    stream.write_all(&buf).await
-}
-
-async fn recv_packet(stream: &mut tokio::net::UnixStream) -> io::Result<Packet> {
-    let mut header = [0u8; HEADER_SIZE];
-    stream.read_exact(&mut header).await?;
-    let msg_type = MsgType::from_u8(header[0])
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown message type"))?;
-    let len = u16::from_le_bytes([header[1], header[2]]) as usize;
-    if len > MAX_PAYLOAD {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "payload too large",
-        ));
-    }
-    let mut payload = vec![0u8; len];
-    if len > 0 {
-        stream.read_exact(&mut payload).await?;
-    }
-    Ok(Packet::new(msg_type, payload))
-}
-
-async fn write_pkt(w: &mut OwnedWriteHalf, pkt: &Packet) -> io::Result<()> {
-    let buf = pkt.encode();
-    w.write_all(&buf).await
-}
-
-async fn recv_packet_half(r: &mut OwnedReadHalf) -> io::Result<Packet> {
-    let mut header = [0u8; HEADER_SIZE];
-    r.read_exact(&mut header).await?;
-    let msg_type = MsgType::from_u8(header[0])
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown message type"))?;
-    let len = u16::from_le_bytes([header[1], header[2]]) as usize;
-    if len > MAX_PAYLOAD {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "payload too large",
-        ));
-    }
-    let mut payload = vec![0u8; len];
-    if len > 0 {
-        r.read_exact(&mut payload).await?;
-    }
-    Ok(Packet::new(msg_type, payload))
 }
 
 #[cfg(test)]

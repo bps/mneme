@@ -1,6 +1,8 @@
 use std::io;
 use std::os::fd::BorrowedFd;
 
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -249,7 +251,10 @@ impl Packet {
     // -- Wire encoding/decoding ---------------------------------------------
 
     /// Encode to wire format: [type:u8][len:u16 LE][payload]
+    ///
+    /// Panics if the public payload has been enlarged beyond `MAX_PAYLOAD`.
     pub fn encode(&self) -> Vec<u8> {
+        assert!(self.payload.len() <= MAX_PAYLOAD, "payload too large");
         let len = self.payload.len() as u16;
         let mut buf = Vec::with_capacity(HEADER_SIZE + self.payload.len());
         buf.push(self.msg_type as u8);
@@ -277,9 +282,13 @@ pub fn write_all_fd(fd: BorrowedFd<'_>, mut buf: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// Read exactly `buf.len()` bytes from fd. Returns Ok(()) or error.
-/// Returns UnexpectedEof if the fd closes before all bytes are read.
-/// Returns WouldBlock if no data is available (non-blocking fd).
+/// Read exactly `buf.len()` bytes, retrying only EINTR.
+///
+/// Returns UnexpectedEof on early EOF and WouldBlock on EAGAIN, including
+/// after partial progress or when a blocking socket's SO_RCVTIMEO expires.
+/// Socket timeouts apply to each read, not to the whole frame. On failure,
+/// some bytes may already have been consumed and copied into `buf`; this
+/// helper does not retain an offset for resuming the read.
 pub fn read_exact_fd(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<()> {
     let mut pos = 0;
     while pos < buf.len() {
@@ -287,14 +296,6 @@ pub fn read_exact_fd(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<()> {
             Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
             Ok(n) => pos += n,
             Err(rustix::io::Errno::INTR) => continue,
-            Err(rustix::io::Errno::AGAIN) => {
-                if pos == 0 {
-                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
-                }
-                // Partial read: keep trying (data is in-flight)
-                std::thread::yield_now();
-                continue;
-            }
             Err(e) => return Err(e.into()),
         }
     }
@@ -302,16 +303,29 @@ pub fn read_exact_fd(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<()> {
 }
 
 /// Send a packet on a blocking fd.
+///
+/// On error, discard the connection: a partial frame may have been written.
 pub fn send_packet(fd: BorrowedFd<'_>, pkt: &Packet) -> io::Result<()> {
+    validate_packet(pkt)?;
     let encoded = pkt.encode();
     write_all_fd(fd, &encoded)
 }
 
 /// Receive a packet from a blocking fd.
+///
+/// On any error (including WouldBlock), discard the connection: a header or
+/// partial payload may have been consumed. This is not a resumable decoder.
 pub fn recv_packet(fd: BorrowedFd<'_>) -> io::Result<Packet> {
     let mut header = [0u8; HEADER_SIZE];
     read_exact_fd(fd, &mut header)?;
 
+    let (msg_type, len) = decode_header(header)?;
+    let mut payload = vec![0u8; len];
+    read_exact_fd(fd, &mut payload)?;
+    Ok(Packet::new(msg_type, payload))
+}
+
+fn decode_header(header: [u8; HEADER_SIZE]) -> io::Result<(MsgType, usize)> {
     let msg_type = MsgType::from_u8(header[0])
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown message type"))?;
     let len = u16::from_le_bytes([header[1], header[2]]) as usize;
@@ -322,16 +336,51 @@ pub fn recv_packet(fd: BorrowedFd<'_>) -> io::Result<Packet> {
         ));
     }
 
-    let mut payload = vec![0u8; len];
-    if len > 0 {
-        read_exact_fd(fd, &mut payload)?;
-    }
+    Ok((msg_type, len))
+}
 
+fn validate_packet(pkt: &Packet) -> io::Result<()> {
+    // Packet fields are public, so construction-time validation is not enough.
+    if pkt.payload.len() > MAX_PAYLOAD {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "payload too large",
+        ));
+    }
+    Ok(())
+}
+
+/// Send one v1 frame. Rejects oversized payloads before writing any bytes.
+///
+/// Not cancellation-safe: cancellation or an I/O error can leave a partial
+/// frame on the wire. The caller must then discard the connection. Use a
+/// dedicated writer task, or a timeout that drops the connection on expiry.
+pub async fn send_packet_async<W: AsyncWrite + Unpin + ?Sized>(
+    writer: &mut W,
+    pkt: &Packet,
+) -> io::Result<()> {
+    validate_packet(pkt)?;
+    writer.write_all(&pkt.encode()).await
+}
+
+/// Receive one v1 frame, validating type and length before payload allocation.
+/// Payload-specific validation remains the caller's responsibility.
+///
+/// Not cancellation-safe: cancellation or any error can consume a header or
+/// partial payload. The caller must then discard the connection, not restart
+/// this function on the same stream. Use a dedicated reader task, or a timeout
+/// that drops the connection on expiry; do not race this in a reusable select.
+pub async fn recv_packet_async<R: AsyncRead + Unpin + ?Sized>(
+    reader: &mut R,
+) -> io::Result<Packet> {
+    let mut header = [0u8; HEADER_SIZE];
+    reader.read_exact(&mut header).await?;
+    let (msg_type, len) = decode_header(header)?;
+    let mut payload = vec![0u8; len];
+    reader.read_exact(&mut payload).await?;
     Ok(Packet::new(msg_type, payload))
 }
 
-// ---------------------------------------------------------------------------
-// Non-blocking I/O helpers for the server event loop
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
