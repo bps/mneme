@@ -36,7 +36,6 @@ use crate::protocol::{
 use crate::ring::RingBuffer;
 
 use std::io;
-#[cfg(target_os = "macos")]
 use std::os::fd::AsRawFd;
 use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::path::PathBuf;
@@ -58,6 +57,9 @@ use tokio::sync::mpsc;
 const OUTBOUND_CAP: usize = 64;
 const READ_BUF_SIZE: usize = 4096;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+// Leave headroom for the CLI's two-second lock-release deadline.
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(300);
+const REAP_TIMEOUT: Duration = Duration::from_millis(500);
 
 // ---------------------------------------------------------------------------
 // Platform helpers
@@ -301,37 +303,43 @@ fn run_server_inner(
         .build()?;
 
     rt.block_on(async move {
+        // Install handlers before spawning. The outer select remains responsive
+        // even when mainloop is awaiting a full client queue.
+        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let mut child_exit = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child())?;
+
         // Spawn the child *inside* the runtime so tokio can wire SIGCHLD.
         let mut child = spawn_child(&opts.command, follower_fd)
             .map_err(|e| format!("spawn {:?}: {e}", opts.command))?;
-        let child_pid = child.id().unwrap_or(0);
 
-        // PTY leader must be non-blocking for AsyncFd.
-        set_nonblocking(&leader_fd)?;
-        let leader = std::sync::Arc::new(
-            AsyncFd::with_interest(leader_fd, Interest::READABLE | Interest::WRITABLE)
-                .map_err(|e| format!("AsyncFd PTY: {e}"))?,
-        );
+        let result = async {
+            // PTY leader must be non-blocking for AsyncFd.
+            set_nonblocking(&leader_fd)?;
+            let leader = std::sync::Arc::new(
+                AsyncFd::with_interest(leader_fd, Interest::READABLE | Interest::WRITABLE)
+                    .map_err(|e| format!("AsyncFd PTY: {e}"))?,
+            );
 
-        let listener = UnixListener::from_std(std_listener)?;
+            let listener = UnixListener::from_std(std_listener)?;
 
-        let result = mainloop(
-            listener,
-            leader,
-            &mut child,
-            child_pid,
-            opts.ring_size,
-            reporter,
-        )
-        .await;
+            tokio::select! {
+                biased;
+                _ = terminate.recv() => {
+                    let foreground = foreground_group(leader.get_ref());
+                    drop(leader);
+                    // Cancellation aborts mainloop's tasks. Let their PTY clones
+                    // close so a child cannot block exiting on terminal flush.
+                    tokio::task::yield_now().await;
+                    shutdown_child(&mut child, foreground).await
+                },
+                result = mainloop(listener, leader.clone(), &mut child, &mut child_exit, opts.ring_size, reporter) => result,
+            }
+        }.await;
 
-        // Make sure the child is reaped before we exit.
-        if let Ok(None) = child.try_wait() {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
-
-        result
+        // Also covers failures in post-spawn PTY/listener registration. Child::id
+        // becomes None after wait(), so never signal an old, reusable group ID.
+        let cleanup = shutdown_child(&mut child, None).await;
+        result.and(cleanup)
     })?;
 
     let _ = std::fs::remove_file(&opts.socket_path);
@@ -383,7 +391,17 @@ fn spawn_child(command: &[String], follower_fd: OwnedFd) -> io::Result<tokio::pr
 
     unsafe {
         command.pre_exec(|| {
-            libc::setsid();
+            // The server ignores HUP to survive detachment; the command must
+            // not inherit that disposition. Only async-signal-safe libc calls
+            // are allowed between fork and exec.
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = libc::SIG_DFL;
+            libc::sigemptyset(&mut action.sa_mask);
+            if libc::sigaction(libc::SIGHUP, &action, std::ptr::null_mut()) < 0
+                || libc::setsid() < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
             if libc::ioctl(0, libc::TIOCSCTTY as libc::c_ulong, 0) < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -392,6 +410,114 @@ fn spawn_child(command: &[String], follower_fd: OwnedFd) -> io::Result<tokio::pr
     }
 
     command.spawn()
+}
+
+// Observe exit without reaping: group shutdown must precede PID reuse.
+async fn observe_child_exit(pid: u32, signal: &mut tokio::signal::unix::Signal) -> io::Result<u32> {
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { info.si_pid() } != 0 {
+            return Ok(if info.si_code == libc::CLD_EXITED {
+                unsafe { info.si_status() as u32 }
+            } else {
+                1
+            });
+        }
+        if signal.recv().await.is_none() {
+            return Err(io::Error::other("child signal stream closed"));
+        }
+    }
+}
+
+fn signal_group(pgid: libc::pid_t, signal: libc::c_int) -> io::Result<()> {
+    if unsafe { libc::kill(-pgid, signal) } == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    // Darwin reports EPERM rather than ESRCH when the owned group contains
+    // only zombies. Its live, same-user members would be signalable.
+    let zombie_group = cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EPERM);
+    if error.raw_os_error() == Some(libc::ESRCH) || zombie_group {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            error.kind(),
+            format!("signal {signal} to group {pgid}: {error}"),
+        ))
+    }
+}
+
+fn foreground_group(leader: &OwnedFd) -> Option<libc::pid_t> {
+    let group = unsafe { libc::tcgetpgrp(leader.as_raw_fd()) };
+    (group > 0).then_some(group)
+}
+
+/// End the managed group and the terminal's active foreground group. HUP lets
+/// shells forward hangup to background jobs; detached/new-session descendants
+/// are not swept. Normal leader exit can clear the terminal's foreground group
+/// before observation. Leaderless foreground groups cannot be revalidated.
+/// The foreground identity check minimizes, but cannot atomically eliminate,
+/// group-ID reuse races on portable Unix. Never use a reaped child's old PID.
+async fn shutdown_child(
+    child: &mut tokio::process::Child,
+    foreground: Option<libc::pid_t>,
+) -> Result<(), crate::Error> {
+    let Some(pid) = child.id().map(|pid| pid as libc::pid_t) else {
+        return Ok(());
+    };
+    let foreground = foreground.filter(|&group| group != pid);
+    let mut error = None;
+    for signal in [libc::SIGHUP, libc::SIGTERM, libc::SIGCONT] {
+        if let Err(e) = signal_group(pid, signal) {
+            error = Some(e);
+        }
+        if let Some(group) = foreground {
+            // Foreground group leaders can exit during the grace period. A
+            // reused PID must not direct a signal into an unrelated session.
+            if unsafe { libc::getsid(group) } == pid
+                && let Err(e) = signal_group(group, signal)
+            {
+                error = Some(e);
+            }
+        }
+    }
+    tokio::time::sleep(SHUTDOWN_GRACE).await;
+    if let Some(group) = foreground
+        && unsafe { libc::getsid(group) } == pid
+        && let Err(e) = signal_group(group, libc::SIGKILL)
+    {
+        error = Some(e);
+    }
+    if let Err(e) = signal_group(pid, libc::SIGKILL) {
+        error = Some(e);
+    }
+    // Always try to reap, including when a signal failed. A pathological child
+    // stuck in the kernel cannot hold the session lock indefinitely.
+    tokio::time::timeout(REAP_TIMEOUT, async {
+        loop {
+            if child.try_wait()?.is_some() {
+                return Ok::<_, io::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "managed child did not exit"))??;
+    match error {
+        Some(e) => Err(e.into()),
+        None => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -442,10 +568,13 @@ async fn mainloop(
     listener: UnixListener,
     leader: std::sync::Arc<AsyncFd<OwnedFd>>,
     child: &mut tokio::process::Child,
-    child_pid: u32,
+    child_exit: &mut tokio::signal::unix::Signal,
     ring_size: usize,
     reporter: &mut crate::startup::Reporter,
 ) -> Result<(), crate::Error> {
+    let child_pid = child.id().unwrap_or(0);
+    // Cancellation must close client-owned PTY clones as well as sockets.
+    let mut tasks = tokio::task::JoinSet::new();
     let mut ring = RingBuffer::new(ring_size);
     let mut clients: Vec<ClientHandle> = Vec::new();
     let mut next_id: u64 = 1;
@@ -488,13 +617,24 @@ async fn mainloop(
         tokio::select! {
             biased;
 
+            // Do not retain completed task handles in long-lived sessions.
+            _ = tasks.join_next(), if !tasks.is_empty() => {}
+
             // Child exit ------------------------------------------------
-            res = child.wait(), if child_running => {
+            res = observe_child_exit(child_pid, child_exit), if child_running => {
+                let status = res?;
+                // End the managed groups before reaping, while the child's PID
+                // still reserves the session/group identity. Exited sessions
+                // can then retain output indefinitely without stale PID kills.
+                if let Err(error) = shutdown_child(child, foreground_group(leader.get_ref())).await {
+                    if child.id().is_some() {
+                        return Err(error);
+                    }
+                    // A signal error must not discard retained output/status
+                    // after the direct child has been successfully reaped.
+                    eprintln!("[mn-srv] group cleanup: {error}");
+                }
                 child_running = false;
-                let status = match res {
-                    Ok(s) => s.code().unwrap_or(1) as u32,
-                    Err(_) => 1,
-                };
                 exit_status = Some(status);
                 eprintln!("[mn-srv] child exited status={status} live_clients={}", clients.len());
                 let pkt = Packet::exit(status);
@@ -594,7 +734,7 @@ async fn mainloop(
                         };
                         // Spawn intake. It owns the stream until handshake done.
                         let ctx = ctrl_tx.clone();
-                        tokio::spawn(intake_task(stream, ctx, child_running, exit_status, ring.capacity() as u32, ring.len() as u32));
+                        tasks.spawn(intake_task(stream, ctx, child_running, exit_status, ring.capacity() as u32, ring.len() as u32));
                     }
                     Err(e) => eprintln!("[mn-srv] accept: {e}"),
                 }
@@ -615,8 +755,8 @@ async fn mainloop(
                             is_controller: false,
                             out_tx,
                         });
-                        tokio::spawn(writer_task(id, write_half, snapshot, out_rx, ctrl_tx.clone()));
-                        tokio::spawn(reader_task(id, read_half, ctrl_tx.clone(), leader.clone(), pty_write_lock.clone(), hello.flags));
+                        tasks.spawn(writer_task(id, write_half, snapshot, out_rx, ctrl_tx.clone()));
+                        tasks.spawn(reader_task(id, read_half, ctrl_tx.clone(), leader.clone(), pty_write_lock.clone(), hello.flags));
                     }
                     ControlMsg::ClientLive { id } => {
                         if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
