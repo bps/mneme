@@ -112,6 +112,11 @@ pub fn attach(
         _ => return Err("unexpected response from server".into()),
     }
 
+    // Keep stdio nonblocking through raw-terminal cleanup. Reverse drop order
+    // matters when stdin and stdout share one open file description.
+    let _stdin_nb = NonblockGuard::set(io::stdin().as_raw_fd()).ok();
+    let _stdout_nb = NonblockGuard::set(io::stdout().as_raw_fd()).ok();
+
     // Raw-mode termios guard before we go async.
     let _raw_guard = match RawTerminal::enter() {
         Ok(g) => Some(g),
@@ -177,13 +182,40 @@ impl RawTerminal {
 impl Drop for RawTerminal {
     fn drop(&mut self) {
         let stdout = io::stdout();
-        let _ = protocol::write_all_fd(
-            stdout.as_fd(),
-            b"\x1b[?1049l\x1b[<u\x1b[0m\x1b[?25h\x1b[?7h\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[r\r\n",
-        );
+        // Give a busy terminal a short opportunity to accept the reset, but
+        // never wait indefinitely for stopped output. Keep partial-write state.
+        let mut reset = b"\x1b[?1049l\x1b[<u\x1b[0m\x1b[?25h\x1b[?7h\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[r\r\n".as_slice();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        while !reset.is_empty() {
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                break;
+            };
+            match rustix::io::write(stdout.as_fd(), reset) {
+                Ok(0) => break,
+                Ok(n) => reset = &reset[n..],
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(rustix::io::Errno::AGAIN) => {
+                    let mut fds = [rustix::event::PollFd::new(
+                        &stdout,
+                        rustix::event::PollFlags::OUT,
+                    )];
+                    let timeout = rustix::event::Timespec {
+                        tv_sec: 0,
+                        tv_nsec: remaining.as_nanos() as _,
+                    };
+                    if rustix::event::poll(&mut fds, Some(&timeout)).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
         let stdin = io::stdin();
+        // TCSAFLUSH waits for output drain even with O_NONBLOCK. Restore
+        // immediately, then flush only input so a stopped tty cannot hang us.
         let _ =
-            rustix::termios::tcsetattr(&stdin, rustix::termios::OptionalActions::Flush, &self.orig);
+            rustix::termios::tcsetattr(&stdin, rustix::termios::OptionalActions::Now, &self.orig);
+        let _ = rustix::termios::tcflush(&stdin, rustix::termios::QueueSelector::IFlush);
     }
 }
 
@@ -257,9 +289,6 @@ async fn client_mainloop(
     let stdin_fd = io::stdin().as_raw_fd();
     let stdout_fd = io::stdout().as_raw_fd();
 
-    let _stdin_nb = NonblockGuard::set(stdin_fd).ok();
-    let _stdout_nb = NonblockGuard::set(stdout_fd).ok();
-
     // /dev/null and regular files can't be registered with kqueue; if
     // AsyncFd refuses, treat stdin as immediately at EOF so we just
     // wait for the server (e.g. to drive child exit through to the end).
@@ -288,29 +317,46 @@ async fn client_mainloop(
 
     // Split socket and spawn reader/writer tasks.
     let (read_half, write_half) = stream.into_split();
-    let (server_evt_tx, mut server_evt_rx) = mpsc::unbounded_channel::<ServerEvent>();
+    // At most 64 * MAX_PAYLOAD queued bytes, plus one reader packet and one
+    // being written below. Stalled stdout stops socket reads, propagating
+    // backpressure all the way to the producer.
+    let (server_evt_tx, mut server_evt_rx) = mpsc::channel::<ServerEvent>(64);
     let (out_pkt_tx, out_pkt_rx) = mpsc::channel::<Packet>(64);
 
-    tokio::spawn(server_reader_task(read_half, server_evt_tx.clone()));
-    tokio::spawn(server_writer_task(write_half, out_pkt_rx));
+    tokio::spawn(server_reader_task(read_half, server_evt_tx));
+    let writer = tokio::spawn(server_writer_task(write_half, out_pkt_rx));
 
     let mut sigwinch = signal(SignalKind::window_change()).map_err(|e| format!("sigwinch: {e}"))?;
 
     let mut in_replay = true;
     let mut stdin_buf = vec![0u8; 4096];
+    let mut output = Vec::new();
+    let mut output_offset = 0;
+    let mut stdout_blocked = false;
+    // Preserve replay-time typeahead without forwarding it before ReplayEnd.
+    // Like the kernel input queue, finite typeahead can eventually fill;
+    // detach remains readable until this bounded buffer is full.
+    const INPUT_LIMIT: usize = 16 * MAX_PAYLOAD;
+    let mut input = Vec::with_capacity(INPUT_LIMIT);
+    let mut resize_pending = false;
+    let mut writer_open = true;
 
     let mut stdout_log = stdout_log;
     let debug_file = debug_file;
 
     loop {
-        // Stdin handling depends on whether replay is over and whether we've EOF'd.
-        let stdin_active = !in_replay && !stdin_eof;
+        // Preserve replay-first handling of pretyped detach, unless stdout
+        // actually stalls. A stopped terminal must still allow local detach.
+        let stdin_active =
+            !stdin_eof && input.len() < INPUT_LIMIT && (!in_replay || stdout_blocked);
+        let input_room = stdin_buf.len().min(INPUT_LIMIT - input.len());
 
+        // Fair selection keeps input/signals responsive under continuous
+        // output. No branch waits for a whole stdout packet or queue capacity.
         tokio::select! {
-            biased;
-
-            // Server events ----------------------------------------------------
-            evt = server_evt_rx.recv() => {
+            // Preserve event order, including ReplayEnd and Exit, by draining
+            // the active output packet before receiving another event.
+            evt = server_evt_rx.recv(), if output.is_empty() => {
                 let evt = match evt {
                     Some(e) => e,
                     None => return Ok(AttachResult::IoError(DisconnectReason::ServerHungUp)),
@@ -321,28 +367,14 @@ async fn client_mainloop(
                             use std::io::Write;
                             let _ = f.write_all(&bytes);
                         }
-                        let res = match stdout_async.as_ref() {
-                            Some(a) => write_async(a, &bytes).await,
-                            None => {
-                                let bfd = unsafe { BorrowedFd::borrow_raw(stdout_fd) };
-                                protocol::write_all_fd(bfd, &bytes)
-                            }
-                        };
-                        if let Err(e) = res {
-                            return Ok(AttachResult::IoError(DisconnectReason::ServerWrite(e)));
-                        }
+                        output = bytes;
+                        output_offset = 0;
                     }
                     ServerEvent::ReplayEnd => {
                         in_replay = false;
-                        if let Err(e) = send_resize(&out_pkt_tx).await {
-                            return Ok(AttachResult::IoError(DisconnectReason::ServerWrite(e)));
-                        }
+                        resize_pending = true;
                     }
-                    ServerEvent::ResizeReq => {
-                        if let Err(e) = send_resize(&out_pkt_tx).await {
-                            return Ok(AttachResult::IoError(DisconnectReason::ServerWrite(e)));
-                        }
-                    }
+                    ServerEvent::ResizeReq => resize_pending = true,
                     ServerEvent::Exit(status) => return Ok(AttachResult::Exited(status)),
                     ServerEvent::Error(msg) => {
                         return Ok(AttachResult::IoError(DisconnectReason::ServerError(msg)))
@@ -356,11 +388,51 @@ async fn client_mainloop(
                 }
             }
 
-            // SIGWINCH ---------------------------------------------------------
-            _ = sigwinch.recv(), if !in_replay => {
-                if let Err(e) = send_resize(&out_pkt_tx).await {
-                    return Ok(AttachResult::IoError(DisconnectReason::ServerWrite(e)));
+            // One successful write per future; the offset survives select
+            // cancellation, so partial writes cannot be duplicated or lost.
+            res = write_stdout(stdout_async.as_ref(), stdout_fd, &output[output_offset..], stdout_blocked),
+                if !output.is_empty() => {
+                match res {
+                    Ok(n) => {
+                        stdout_blocked = false;
+                        output_offset += n;
+                        if output_offset == output.len() {
+                            output.clear();
+                            output_offset = 0;
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock && stdout_async.is_some() => {
+                        stdout_blocked = true;
+                    }
+                    Err(e) => return Ok(AttachResult::IoError(DisconnectReason::ServerWrite(e))),
                 }
+            }
+
+            // Coalesce resize notifications; enqueue typeahead after replay.
+            permit = out_pkt_tx.clone().reserve_owned(),
+                if writer_open && (resize_pending || (!in_replay && !input.is_empty())) => {
+                let Ok(permit) = permit else {
+                    // A final resize/input can race the peer closing its read
+                    // side after sending Exit. Keep draining ordered events;
+                    // only the reader can tell us whether Exit was delivered.
+                    writer_open = false;
+                    continue;
+                };
+                if resize_pending {
+                    let (rows, cols) = crate::get_terminal_size();
+                    permit.send(Packet::resize(rows, cols));
+                    resize_pending = false;
+                } else {
+                    let n = input.len().min(MAX_PAYLOAD);
+                    permit.send(Packet::content(&input[..n]));
+                    input.drain(..n);
+                }
+            }
+
+            // SIGWINCH ---------------------------------------------------------
+            _ = sigwinch.recv() => {
+                // ReplayEnd will request the latest size after replay drains.
+                resize_pending |= !in_replay;
             }
 
             // Stdin readable ---------------------------------------------------
@@ -376,7 +448,7 @@ async fn client_mainloop(
                 };
                 let n = match guard.try_io(|inner| {
                     let fd = unsafe { BorrowedFd::borrow_raw(inner.get_ref().as_raw_fd()) };
-                    match rustix::io::read(fd, &mut stdin_buf) {
+                    match rustix::io::read(fd, &mut stdin_buf[..input_room]) {
                         Ok(0) => Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
                         Ok(n) => Ok(n),
                         Err(rustix::io::Errno::AGAIN) => Err(io::ErrorKind::WouldBlock.into()),
@@ -387,6 +459,7 @@ async fn client_mainloop(
                     Ok(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => continue,
                     Ok(Err(_)) => {
                         if stdin_is_tty {
+                            finish_detach(out_pkt_tx, writer, &input).await;
                             return Ok(AttachResult::Detached);
                         }
                         stdin_eof = true;
@@ -402,21 +475,15 @@ async fn client_mainloop(
 
                 let detach_pos = find_detach_key(&stdin_buf[..n], detach_key, &csi_u_detach);
                 if let Some((pos, _len)) = detach_pos {
-                    if pos > 0 && !flags.contains(ClientFlags::READONLY) {
-                        for chunk in stdin_buf[..pos].chunks(MAX_PAYLOAD) {
-                            let _ = out_pkt_tx.send(Packet::content(chunk)).await;
-                        }
+                    if !flags.contains(ClientFlags::READONLY) {
+                        input.extend_from_slice(&stdin_buf[..pos]);
                     }
-                    let _ = out_pkt_tx.send(Packet::empty(MsgType::Detach)).await;
+                    finish_detach(out_pkt_tx, writer, &input).await;
                     return Ok(AttachResult::Detached);
                 }
 
                 if !flags.contains(ClientFlags::READONLY) {
-                    for chunk in stdin_buf[..n].chunks(MAX_PAYLOAD) {
-                        if out_pkt_tx.send(Packet::content(chunk)).await.is_err() {
-                            return Ok(AttachResult::IoError(DisconnectReason::ServerHungUp));
-                        }
-                    }
+                    input.extend_from_slice(&stdin_buf[..n]);
                 }
             }
         }
@@ -427,16 +494,16 @@ async fn client_mainloop(
 // Tasks
 // ---------------------------------------------------------------------------
 
-async fn server_reader_task(mut r: OwnedReadHalf, tx: mpsc::UnboundedSender<ServerEvent>) {
+async fn server_reader_task(mut r: OwnedReadHalf, tx: mpsc::Sender<ServerEvent>) {
     loop {
         let pkt = match recv_packet_half(&mut r).await {
             Ok(p) => p,
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                let _ = tx.send(ServerEvent::HungUp);
+                let _ = tx.send(ServerEvent::HungUp).await;
                 return;
             }
             Err(e) => {
-                let _ = tx.send(ServerEvent::ReadFailed(e));
+                let _ = tx.send(ServerEvent::ReadFailed(e)).await;
                 return;
             }
         };
@@ -453,7 +520,7 @@ async fn server_reader_task(mut r: OwnedReadHalf, tx: mpsc::UnboundedSender<Serv
             }
             _ => continue,
         };
-        if tx.send(evt).is_err() {
+        if tx.send(evt).await.is_err() {
             return;
         }
     }
@@ -473,15 +540,43 @@ async fn server_writer_task(mut w: OwnedWriteHalf, mut rx: mpsc::Receiver<Packet
 // Helpers
 // ---------------------------------------------------------------------------
 
-async fn send_resize(tx: &mpsc::Sender<Packet>) -> io::Result<()> {
-    let (rows, cols) = crate::get_terminal_size();
-    tx.send(Packet::resize(rows, cols))
-        .await
-        .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))
+async fn finish_detach(
+    tx: mpsc::Sender<Packet>,
+    writer: tokio::task::JoinHandle<()>,
+    input: &[u8],
+) {
+    // Flush queued input and Detach if possible, but never let a stalled peer
+    // prevent local detach. Socket EOF also unregisters the client.
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(100), async move {
+        for chunk in input.chunks(MAX_PAYLOAD) {
+            if tx.send(Packet::content(chunk)).await.is_err() {
+                return;
+            }
+        }
+        let _ = tx.send(Packet::empty(MsgType::Detach)).await;
+        drop(tx);
+        let _ = writer.await;
+    })
+    .await;
 }
 
-async fn write_async(out: &AsyncFd<StdioFd>, mut buf: &[u8]) -> io::Result<()> {
-    while !buf.is_empty() {
+async fn write_stdout(
+    out: Option<&AsyncFd<StdioFd>>,
+    fd: RawFd,
+    buf: &[u8],
+    wait_for_ready: bool,
+) -> io::Result<usize> {
+    if !wait_for_ready || out.is_none() {
+        // Try once before awaiting readiness, so the main task can observe
+        // EAGAIN and enable replay-time detach. Also handles regular files.
+        return match rustix::io::write(unsafe { BorrowedFd::borrow_raw(fd) }, buf) {
+            Ok(0) => Err(io::ErrorKind::WriteZero.into()),
+            Ok(n) => Ok(n),
+            Err(e) => Err(e.into()),
+        };
+    }
+    let out = out.unwrap();
+    loop {
         let mut guard = out.writable().await?;
         match guard.try_io(|inner| {
             let fd = unsafe { BorrowedFd::borrow_raw(inner.get_ref().as_raw_fd()) };
@@ -492,13 +587,12 @@ async fn write_async(out: &AsyncFd<StdioFd>, mut buf: &[u8]) -> io::Result<()> {
                 Err(e) => Err(io::Error::from(e)),
             }
         }) {
-            Ok(Ok(n)) => buf = &buf[n..],
+            Ok(Ok(n)) => return Ok(n),
             Ok(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => continue,
             Ok(Err(e)) => return Err(e),
             Err(_) => continue,
         }
     }
-    Ok(())
 }
 
 async fn recv_packet_half(r: &mut OwnedReadHalf) -> io::Result<Packet> {
