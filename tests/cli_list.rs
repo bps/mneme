@@ -26,7 +26,10 @@ struct Env {
 impl Env {
     fn new() -> Self {
         Self {
-            dir: TempDir::new().unwrap(),
+            dir: tempfile::Builder::new()
+                .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .tempdir()
+                .unwrap(),
         }
     }
     fn dir(&self) -> &Path {

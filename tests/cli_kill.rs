@@ -1,8 +1,8 @@
 //! Integration tests for `mn kill <name>` and `mn kill all`.
 //!
 //! These exercise the live-server kill path (query → SIGTERM → wait for
-//! lock release), the stale-cleanup branch, the orphan-lock sweep in
-//! kill-all, and the not-found error branch.
+//! lock release), stale-socket cleanup, preservation of permanent locks,
+//! and the not-found error branch.
 
 use std::io::Read;
 use std::os::fd::AsFd;
@@ -27,7 +27,10 @@ struct Env {
 impl Env {
     fn new() -> Self {
         Self {
-            dir: TempDir::new().unwrap(),
+            dir: tempfile::Builder::new()
+                .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+                .tempdir()
+                .unwrap(),
         }
     }
 
@@ -167,11 +170,11 @@ fn kill_live_session_terminates_server_and_cleans_files() {
         "server pid {pid} still alive after kill"
     );
 
-    // Both files cleaned up.
+    // The socket is cleaned up; the stable lock remains.
     let sock = env.dir().join(&sess);
-    let lock = env.dir().join(format!("{sess}.lock"));
+    let lock = env.dir().join(".locks").join(&sess);
     assert!(!sock.exists(), "socket not cleaned");
-    assert!(!lock.exists(), "lock not cleaned");
+    assert!(lock.exists(), "stable lock inode must remain");
 }
 
 #[test]
@@ -231,7 +234,7 @@ fn kill_stale_session_cleans_files_and_succeeds() {
 
     // Files should still be on disk (no graceful cleanup happened).
     let sock = env.dir().join(&sess);
-    let lock = env.dir().join(format!("{sess}.lock"));
+    let lock = env.dir().join(".locks").join(&sess);
     assert!(sock.exists() || lock.exists(), "expected stale files");
 
     // kill should detect the stale session and clean it up.
@@ -242,7 +245,7 @@ fn kill_stale_session_cleans_files_and_succeeds() {
         "expected stale/killed message, got: {err}"
     );
     assert!(!sock.exists(), "socket not cleaned");
-    assert!(!lock.exists(), "lock not cleaned");
+    assert!(lock.exists(), "stable lock inode must remain");
 }
 
 // ---------------------------------------------------------------------------
@@ -284,12 +287,12 @@ fn kill_all_terminates_every_session() {
         );
     }
 
-    // No files left.
+    // No sockets left; lock inodes remain stable.
     for s in [&s1, &s2, &s3] {
         assert!(!env.dir().join(s).exists(), "socket {s} not cleaned");
         assert!(
-            !env.dir().join(format!("{s}.lock")).exists(),
-            "lock {s} not cleaned"
+            env.dir().join(".locks").join(s).exists(),
+            "stable lock {s} must remain"
         );
     }
 }
@@ -306,11 +309,11 @@ fn kill_all_on_empty_dir_succeeds_with_message() {
 }
 
 #[test]
-fn kill_all_sweeps_orphan_lock_files() {
+fn kill_all_preserves_orphan_lock_files() {
     let env = Env::new();
     let sess = env.session("orphan-sweep");
 
-    // Plant an orphan lock (regular file, no holder, no paired socket).
+    // Plant a legacy orphan file. Never unlink arbitrary regular files.
     let lock = env.dir().join(format!("{sess}.lock"));
     std::fs::write(&lock, b"").unwrap();
     assert!(lock.exists());
@@ -318,7 +321,7 @@ fn kill_all_sweeps_orphan_lock_files() {
     let (code, _, err) = env.run(&["kill", "all"], 5);
     assert_eq!(code, 0, "kill all failed: {err}");
 
-    assert!(!lock.exists(), "orphan lock should have been swept");
+    assert!(lock.exists(), "orphan regular files must be preserved");
 }
 
 #[test]

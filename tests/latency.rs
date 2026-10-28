@@ -15,7 +15,10 @@ fn mn_bin() -> std::path::PathBuf {
 }
 
 fn start_cat_session(prefix: &str) -> (TempDir, String, u32) {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = tempfile::Builder::new()
+        .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .tempdir()
+        .expect("tempdir");
     let session = format!("{prefix}-{}", std::process::id());
 
     let output = Command::new(mn_bin())
@@ -159,7 +162,10 @@ fn profile_roundtrip_latency() {
 fn profile_throughput() {
     // Child produces continuous output. We take multiple 1 MiB windows,
     // each timed independently, and report stats.
-    let dir = TempDir::new().expect("tempdir");
+    let dir = tempfile::Builder::new()
+        .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .tempdir()
+        .expect("tempdir");
     let session = format!("throughput-{}", std::process::id());
 
     let output = Command::new(mn_bin())

@@ -79,6 +79,7 @@ pub fn attach(
 ) -> Result<AttachResult, crate::Error> {
     // Sync handshake -- blocking is fine and gives us crisp early errors.
     let stream = StdUnixStream::connect(socket_path)?;
+    crate::socket::verify_peer_uid(&stream)?;
     stream.set_nonblocking(false)?;
 
     let hello = protocol::Hello {

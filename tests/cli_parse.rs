@@ -6,15 +6,16 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use tempfile::TempDir;
-
 fn mn_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_mn"))
 }
 
 /// Run `mn` with isolated socket dir and return (exit_code, stderr).
 fn run(args: &[&str]) -> (i32, String) {
-    let dir = TempDir::new().unwrap();
+    let dir = tempfile::Builder::new()
+        .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     let mut child = Command::new(mn_bin())
         .env("MNEME_SOCKET_DIR", dir.path())
         .args(args)

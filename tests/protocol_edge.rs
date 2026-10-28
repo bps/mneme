@@ -30,7 +30,10 @@ struct ServerFixture {
 impl ServerFixture {
     /// Start a server with a long-running child, return a fixture for testing.
     fn start(prefix: &str) -> Self {
-        let dir = TempDir::new().expect("failed to create temp dir");
+        let dir = tempfile::Builder::new()
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .tempdir()
+            .expect("failed to create temp dir");
         let session = format!("{prefix}-{}", std::process::id());
 
         let mut cmd = Command::new(mn_bin());

@@ -22,7 +22,10 @@ fn mn_bin() -> std::path::PathBuf {
 // ---------------------------------------------------------------------------
 
 fn start_session(prefix: &str, shell_cmd: &str) -> (TempDir, String, u32) {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = tempfile::Builder::new()
+        .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .tempdir()
+        .expect("tempdir");
     let session = format!("{prefix}-{}", std::process::id());
 
     let output = Command::new(mn_bin())
