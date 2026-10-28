@@ -3,6 +3,7 @@ mod protocol;
 mod ring;
 mod server;
 mod socket;
+mod startup;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::CompleteEnv;
@@ -207,7 +208,11 @@ fn parse_size(s: &str) -> Result<usize, String> {
         (s, 1)
     };
     let n: usize = num_str.parse().map_err(|_| format!("invalid size: {s}"))?;
-    Ok(n * multiplier)
+    let size = n
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("size overflow: {s}"))?;
+    startup::validate_ring_size(size)?;
+    Ok(size)
 }
 
 #[derive(Parser, Debug)]
@@ -502,16 +507,21 @@ fn do_create(
         command.stderr(Stdio::null());
     }
 
-    let _child = command.spawn()?;
+    let child = command.spawn()?;
 
     drop(server_fd);
 
-    let mut error_buf = vec![0u8; 4096];
-    let n = rustix::io::read(&cli_fd, &mut error_buf)?;
-    if n > 0 {
-        let msg = String::from_utf8_lossy(&error_buf[..n]);
-        return Err(format!("server startup failed: {msg}").into());
-    }
+    startup::wait(&cli_fd, startup::READY_TIMEOUT).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::TimedOut {
+            Error::from(format!(
+                "server startup failed: {e}; server pid {} may still be starting at {}",
+                child.id(),
+                socket_path.display()
+            ))
+        } else {
+            Error::from(format!("server startup failed: {e}"))
+        }
+    })?;
 
     if !quiet {
         eprintln!("mn: {name}: session created");

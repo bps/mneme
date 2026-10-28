@@ -227,6 +227,20 @@ fn parse_server_args(args: &[String]) -> io::Result<ServerOpts> {
 
 pub fn run_server(args: &[String]) -> Result<(), crate::Error> {
     let opts = parse_server_args(args)?;
+    let ready_fd = unsafe { OwnedFd::from_raw_fd(opts.ready_fd) };
+    let mut reporter = crate::startup::Reporter::new(ready_fd)?;
+    let result = run_server_inner(opts, &mut reporter);
+    if let Err(ref error) = result {
+        reporter.failure(&error.to_string());
+    }
+    result
+}
+
+fn run_server_inner(
+    opts: ServerOpts,
+    reporter: &mut crate::startup::Reporter,
+) -> Result<(), crate::Error> {
+    crate::startup::validate_ring_size(opts.ring_size)?;
     eprintln!(
         "[mn-srv] startup pid={} session={:?} command={:?}",
         std::process::id(),
@@ -239,9 +253,6 @@ pub fn run_server(args: &[String]) -> Result<(), crate::Error> {
         eprintln!("[mn-srv] PANIC: {info}");
         default_hook(info);
     }));
-
-    let ready_fd = unsafe { OwnedFd::from_raw_fd(opts.ready_fd) };
-    rustix::io::fcntl_setfd(&ready_fd, rustix::io::FdFlags::CLOEXEC)?;
 
     // Detach from controlling terminal. setsid may fail if we're already a
     // process group leader — that's fine.
@@ -295,9 +306,6 @@ pub fn run_server(args: &[String]) -> Result<(), crate::Error> {
             .map_err(|e| format!("spawn {:?}: {e}", opts.command))?;
         let child_pid = child.id().unwrap_or(0);
 
-        // Signal readiness to the CLI by closing the pipe.
-        drop(ready_fd);
-
         // PTY leader must be non-blocking for AsyncFd.
         set_nonblocking(&leader_fd)?;
         let leader = std::sync::Arc::new(
@@ -307,7 +315,15 @@ pub fn run_server(args: &[String]) -> Result<(), crate::Error> {
 
         let listener = UnixListener::from_std(std_listener)?;
 
-        let result = mainloop(listener, leader, &mut child, child_pid, opts.ring_size).await;
+        let result = mainloop(
+            listener,
+            leader,
+            &mut child,
+            child_pid,
+            opts.ring_size,
+            reporter,
+        )
+        .await;
 
         // Make sure the child is reaped before we exit.
         if let Ok(None) = child.try_wait() {
@@ -428,6 +444,7 @@ async fn mainloop(
     child: &mut tokio::process::Child,
     child_pid: u32,
     ring_size: usize,
+    reporter: &mut crate::startup::Reporter,
 ) -> Result<(), crate::Error> {
     let mut ring = RingBuffer::new(ring_size);
     let mut clients: Vec<ClientHandle> = Vec::new();
@@ -452,6 +469,10 @@ async fn mainloop(
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ControlMsg>();
     let pty_write_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
     let mut read_buf = vec![0u8; READ_BUF_SIZE];
+
+    // Report success only after runtime/PTY registration and all initial
+    // main-loop state (including the ring allocation) have been set up.
+    reporter.success()?;
 
     loop {
         // Termination condition: child gone, every client notified+drained.
@@ -903,4 +924,37 @@ async fn recv_packet_half(r: &mut OwnedReadHalf) -> io::Result<Packet> {
         r.read_exact(&mut payload).await?;
     }
     Ok(Packet::new(msg_type, payload))
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    use std::os::fd::IntoRawFd;
+
+    #[test]
+    fn internal_server_rejects_invalid_capacity_and_reports_it() {
+        for size in [0, crate::startup::MAX_RING_SIZE + 1] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let socket = dir.path().join("startup");
+            let (reader, writer) = rustix::pipe::pipe().unwrap();
+            // Transfer ownership as the real CLI does across exec.
+            let args = vec![
+                "startup".into(),
+                "--ready-fd".into(),
+                writer.into_raw_fd().to_string(),
+                "--ring-size".into(),
+                size.to_string(),
+                "--socket-path".into(),
+                socket.to_string_lossy().into_owned(),
+                "--".into(),
+                "/usr/bin/true".into(),
+            ];
+            let result = run_server(&args);
+            assert!(result.is_err());
+            let err = crate::startup::wait(&reader, Duration::from_secs(1)).unwrap_err();
+            assert!(err.to_string().contains("ring size must be between"));
+            assert!(!socket.exists());
+            assert!(!dir.path().join("startup.lock").exists());
+        }
+    }
 }
