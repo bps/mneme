@@ -27,9 +27,9 @@
 //!
 //! Backpressure: PTY fan-out queues output for every registered client,
 //! including clients still replaying their snapshot. The bounded per-client
-//! outbound channel means a slow client makes the main task `await` on `send`,
-//! which stalls the PTY read loop and ultimately the child. Replay must finish
-//! before the writer drains queued output; no post-snapshot bytes are skipped.
+//! outbound channel pauses PTY ingestion when any client has insufficient
+//! capacity. Control events and new connections remain responsive. Replay must
+//! finish before the writer drains queued output; no post-snapshot bytes are skipped.
 
 use crate::protocol::{
     self, ClientFlags, HEADER_SIZE, Hello, Intent, MAX_PAYLOAD, MsgType, PROTOCOL_VERSION, Packet,
@@ -46,7 +46,7 @@ use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest};
 use tokio::net::UnixListener;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -57,6 +57,8 @@ use tokio::sync::mpsc;
 /// 256 KiB — matches the original byte-budget per client.
 const OUTBOUND_CAP: usize = 64;
 const READ_BUF_SIZE: usize = 4096;
+const READ_PACKETS: usize = READ_BUF_SIZE.div_ceil(MAX_PAYLOAD);
+const CLIENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 // Leave headroom for the CLI's two-second lock-release deadline.
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(300);
@@ -548,6 +550,52 @@ struct ClientHandle {
     state: ClientState,
     is_controller: bool,
     out_tx: mpsc::Sender<OutMsg>,
+    // Coalesced control state stays bounded even if the outbound queue is full.
+    resize_pending: bool,
+    exit_pending: Option<u32>,
+    shutdown_pending: bool,
+    drain_deadline: Option<tokio::time::Instant>,
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+
+impl Drop for ClientHandle {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+impl ClientHandle {
+    fn controls_pending(&self) -> bool {
+        self.resize_pending || self.exit_pending.is_some() || self.shutdown_pending
+    }
+
+    fn flush_controls(&mut self) {
+        if self.resize_pending {
+            if self
+                .out_tx
+                .try_send(OutMsg::Packet(Packet::empty(MsgType::ResizeReq)))
+                .is_err()
+            {
+                return;
+            }
+            self.resize_pending = false;
+        }
+        if let Some(status) = self.exit_pending {
+            if self
+                .out_tx
+                .try_send(OutMsg::Packet(Packet::exit(status)))
+                .is_err()
+            {
+                return;
+            }
+            self.exit_pending = None;
+        }
+        if self.shutdown_pending && self.out_tx.try_send(OutMsg::Shutdown).is_ok() {
+            self.shutdown_pending = false;
+        }
+    }
 }
 
 enum ControlMsg {
@@ -560,7 +608,7 @@ enum ControlMsg {
     ClientLive { id: u64 },
     /// Reader task: client requested a resize.
     Resize { id: u64, rows: u16, cols: u16 },
-    /// Reader task: client sent Detach (close gracefully).
+    /// Reader task: client requested disconnect.
     Detach { id: u64 },
     /// Reader OR writer task: socket closed / I/O error.
     ClientGone { id: u64 },
@@ -602,6 +650,7 @@ async fn mainloop(
     });
 
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ControlMsg>();
+    let capacity_changed = std::sync::Arc::new(Notify::new());
     let pty_write_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
     let mut read_buf = vec![0u8; READ_BUF_SIZE];
 
@@ -616,12 +665,35 @@ async fn mainloop(
             break;
         }
 
-        // Every registered client receives post-snapshot PTY output, even
-        // during replay. A full outbound queue stalls PTY reads rather than
-        // dropping bytes; the writer can drain without mainloop processing
-        // its ClientLive event.
+        let now = tokio::time::Instant::now();
+        let before = clients.len();
+        clients.retain(|c| {
+            let expired = c.drain_deadline.is_some_and(|deadline| deadline <= now);
+            if expired {
+                eprintln!("[mn-srv] client {} exceeded exit drain deadline", c.id);
+            }
+            !expired
+        });
+        if clients.len() != before {
+            elect_controller(&mut clients);
+        }
+        for c in &mut clients {
+            c.flush_controls();
+        }
+        let drain_deadline = clients.iter().filter_map(|c| c.drain_deadline).min();
+        // Mainloop is the only sender. With no await between this capacity
+        // check and fan-out, a read cannot overrun any client's bounded queue.
+        let output_ready = output_ready(&clients);
         tokio::select! {
-            biased;
+            // Randomized selection prevents a continuously readable PTY or
+            // busy control channel from starving accepts and other controls.
+            _ = capacity_changed.notified() => {}
+            _ = async {
+                match drain_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {}
 
             // Do not retain completed task handles in long-lived sessions.
             _ = tasks.join_next(), if !tasks.is_empty() => {}
@@ -643,11 +715,10 @@ async fn mainloop(
                 child_running = false;
                 exit_status = Some(status);
                 eprintln!("[mn-srv] child exited status={status} live_clients={}", clients.len());
-                let pkt = Packet::exit(status);
-                for c in &clients {
+                for c in &mut clients {
                     if c.state == ClientState::Live {
-                        // Best-effort send; if writer is gone the channel is closed.
-                        let _ = c.out_tx.send(OutMsg::Packet(pkt.clone())).await;
+                        c.exit_pending = Some(status);
+                        c.drain_deadline = Some(tokio::time::Instant::now() + CLIENT_DRAIN_TIMEOUT);
                         exit_notified = true;
                     }
                 }
@@ -662,7 +733,7 @@ async fn mainloop(
             // Note: we keep polling even after `child_running` flips false,
             // because data the child wrote just before exiting may still be
             // sitting in the PTY master read buffer. We only stop on EIO/EOF.
-            guard = leader.readable(), if !pty_eof => {
+            guard = leader.readable(), if !pty_eof && output_ready => {
                 let mut guard = match guard {
                     Ok(g) => g,
                     Err(_) => continue,
@@ -684,7 +755,7 @@ async fn mainloop(
                         }
                         ring.write(data);
 
-                        fan_out(&clients, data).await;
+                        try_fan_out(&clients, data);
                     }
                     Ok(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => {}
                     Ok(Err(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
@@ -748,9 +819,15 @@ async fn mainloop(
                             state: ClientState::Replaying,
                             is_controller: false,
                             out_tx,
+                            resize_pending: false,
+                            exit_pending: None,
+                            shutdown_pending: false,
+                            drain_deadline: None,
+                            tasks: vec![
+                                tasks.spawn(writer_task(id, write_half, snapshot, out_rx, ctrl_tx.clone(), capacity_changed.clone())),
+                                tasks.spawn(reader_task(id, read_half, ctrl_tx.clone(), leader.clone(), pty_write_lock.clone(), hello.flags)),
+                            ],
                         });
-                        tasks.spawn(writer_task(id, write_half, snapshot, out_rx, ctrl_tx.clone()));
-                        tasks.spawn(reader_task(id, read_half, ctrl_tx.clone(), leader.clone(), pty_write_lock.clone(), hello.flags));
                     }
                     ControlMsg::ClientLive { id } => {
                         if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
@@ -758,11 +835,12 @@ async fn mainloop(
                             // If child already exited before this client became
                             // Live, send Exit immediately so it doesn't hang.
                             if !child_running && let Some(s) = exit_status {
-                                let _ = c.out_tx.send(OutMsg::Packet(Packet::exit(s))).await;
-                                let _ = c.out_tx.send(OutMsg::Shutdown).await;
+                                c.exit_pending = Some(s);
+                                c.shutdown_pending = true;
+                                c.drain_deadline = Some(tokio::time::Instant::now() + CLIENT_DRAIN_TIMEOUT);
                                 exit_notified = true;
                             }
-                            elect_controller(&mut clients).await;
+                            elect_controller(&mut clients);
                         }
                     }
                     ControlMsg::Resize { id, rows, cols } => {
@@ -775,15 +853,12 @@ async fn mainloop(
                             }
                         }
                     }
-                    ControlMsg::Detach { id } => {
-                        if let Some(c) = clients.iter().find(|c| c.id == id) {
-                            let _ = c.out_tx.send(OutMsg::Shutdown).await;
-                        }
-                    }
-                    ControlMsg::ClientGone { id } => {
+                    // Detach is an explicit disconnect, not an output drain.
+                    // Removing it releases backpressure even if it never reads.
+                    ControlMsg::Detach { id } | ControlMsg::ClientGone { id } => {
                         if let Some(pos) = clients.iter().position(|c| c.id == id) {
                             clients.remove(pos);
-                            elect_controller(&mut clients).await;
+                            elect_controller(&mut clients);
                         }
                     }
                 }
@@ -794,15 +869,35 @@ async fn mainloop(
     Ok(())
 }
 
-async fn fan_out(clients: &[ClientHandle], data: &[u8]) {
+fn output_ready(clients: &[ClientHandle]) -> bool {
+    clients.iter().all(|c| {
+        c.out_tx.is_closed() || (!c.controls_pending() && c.out_tx.capacity() >= READ_PACKETS)
+    })
+}
+
+fn try_fan_out(clients: &[ClientHandle], data: &[u8]) {
     for chunk in data.chunks(MAX_PAYLOAD) {
         let pkt = Packet::content(chunk);
         for c in clients {
-            // Include replaying clients. Their writer sends ReplayEnd before
-            // draining this bounded queue. If it fills, stall PTY reads.
-            // A closed channel is cleaned up via ClientGone.
-            let _ = c.out_tx.send(OutMsg::Packet(pkt.clone())).await;
+            // Includes replaying clients. ReplayEnd precedes queue draining.
+            match c.out_tx.try_send(OutMsg::Packet(pkt.clone())) {
+                Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    unreachable!("PTY read exceeded reserved outbound capacity")
+                }
+            }
         }
+    }
+}
+
+// Exercise the same admission check and fan-out as mainloop in replay tests.
+#[cfg(test)]
+async fn fan_out(clients: &[ClientHandle], data: &[u8], capacity_changed: &Notify) {
+    for chunk in data.chunks(READ_BUF_SIZE) {
+        while !output_ready(clients) {
+            capacity_changed.notified().await;
+        }
+        try_fan_out(clients, chunk);
     }
 }
 
@@ -829,7 +924,7 @@ async fn write_pty(leader: &AsyncFd<OwnedFd>, mut buf: &[u8]) {
     }
 }
 
-async fn elect_controller(clients: &mut [ClientHandle]) {
+fn elect_controller(clients: &mut [ClientHandle]) {
     let old = clients.iter().position(|c| c.is_controller);
     let mut new_idx = None;
     for (i, c) in clients.iter().enumerate().rev() {
@@ -849,8 +944,7 @@ async fn elect_controller(clients: &mut [ClientHandle]) {
     }
     if let Some(i) = new_idx {
         clients[i].is_controller = true;
-        let pkt = Packet::empty(MsgType::ResizeReq);
-        let _ = clients[i].out_tx.send(OutMsg::Packet(pkt)).await;
+        clients[i].resize_pending = true;
     }
 }
 
@@ -929,6 +1023,7 @@ async fn writer_task(
     snapshot: Vec<u8>,
     mut rx: mpsc::Receiver<OutMsg>,
     ctrl_tx: mpsc::UnboundedSender<ControlMsg>,
+    capacity_changed: std::sync::Arc<Notify>,
 ) {
     // 1. Send replay snapshot.
     let mut ok = true;
@@ -949,19 +1044,25 @@ async fn writer_task(
         ok = false;
     }
     if !ok {
+        drop(rx);
+        capacity_changed.notify_one();
         let _ = ctrl_tx.send(ControlMsg::ClientGone { id });
         return;
     }
-    // 2. Notify main: client is Live. Do not wait for an acknowledgment:
-    // mainloop may be blocked sending post-snapshot output to our full queue.
+    // 2. Notify main: client is Live. Queue draining does not require an ack.
     if ctrl_tx.send(ControlMsg::ClientLive { id }).is_err() {
         return;
     }
     // 3. Drain outbound channel.
     while let Some(msg) = rx.recv().await {
+        // notify_one stores a permit if mainloop is between its capacity
+        // check and select, so a freed slot cannot cause a lost wakeup.
+        capacity_changed.notify_one();
         match msg {
             OutMsg::Packet(p) => {
                 if write_pkt(&mut w, &p).await.is_err() {
+                    drop(rx);
+                    capacity_changed.notify_one();
                     let _ = ctrl_tx.send(ControlMsg::ClientGone { id });
                     return;
                 }
@@ -1138,7 +1239,46 @@ mod tests {
             state,
             is_controller: false,
             out_tx,
+            resize_pending: false,
+            exit_pending: None,
+            shutdown_pending: false,
+            drain_deadline: None,
+            tasks: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn full_queue_defers_coalesced_controls_without_blocking() {
+        let (out_tx, mut out_rx) = mpsc::channel(2);
+        let mut clients = vec![client(1, ClientState::Live, out_tx)];
+        for _ in 0..2 {
+            clients[0]
+                .out_tx
+                .try_send(OutMsg::Packet(Packet::content(b"queued")))
+                .unwrap();
+        }
+        elect_controller(&mut clients);
+        clients[0].exit_pending = Some(7);
+        clients[0].shutdown_pending = true;
+        clients[0].flush_controls();
+        assert!(clients[0].is_controller);
+        assert!(clients[0].controls_pending());
+        assert!(!output_ready(&clients));
+        for expected in [
+            MsgType::Content,
+            MsgType::Content,
+            MsgType::ResizeReq,
+            MsgType::Exit,
+        ] {
+            clients[0].flush_controls();
+            let OutMsg::Packet(packet) = out_rx.recv().await.unwrap() else {
+                panic!("Shutdown overtook queued output/control");
+            };
+            assert_eq!(packet.msg_type, expected);
+        }
+        clients[0].flush_controls();
+        assert!(matches!(out_rx.recv().await, Some(OutMsg::Shutdown)));
+        assert!(!clients[0].controls_pending());
     }
 
     #[tokio::test]
@@ -1156,6 +1296,7 @@ mod tests {
                 client(2, ClientState::Live, live_tx),
             ];
             let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
+            let capacity_changed = std::sync::Arc::new(Notify::new());
             // Disable cooperative yields only in this test, so Pending means
             // socket/channel backpressure rather than an exhausted task budget.
             let mut writer = Box::pin(tokio::task::unconstrained(writer_task(
@@ -1164,6 +1305,7 @@ mod tests {
                 snapshot.clone(),
                 out_rx,
                 ctrl_tx,
+                capacity_changed.clone(),
             )));
 
             // No peer reads yet: replay cannot finish. Keep the writer parked
@@ -1184,7 +1326,7 @@ mod tests {
             let (release, gate) = oneshot::channel();
             let mut producer = Box::pin(tokio::task::unconstrained(async {
                 gate.await.unwrap();
-                fan_out(&clients, &expected).await;
+                fan_out(&clients, &expected, &capacity_changed).await;
                 for c in &clients {
                     c.out_tx.send(OutMsg::Shutdown).await.unwrap();
                 }
@@ -1193,7 +1335,7 @@ mod tests {
             assert_eq!(out_tx.capacity(), OUTBOUND_CAP);
             release.send(()).unwrap();
             assert!(poll_once(producer.as_mut()).await.is_pending());
-            // The 65th packet is blocked, not dropped or buffered elsewhere.
+            // The next read is blocked, not dropped or buffered elsewhere.
             assert_eq!(out_tx.capacity(), 0);
             assert_eq!(clients[1].out_tx.capacity(), 0);
             assert!(matches!(
@@ -1234,6 +1376,7 @@ mod tests {
             let receive_live = async {
                 let mut content = Vec::new();
                 while let Some(msg) = live_rx.recv().await {
+                    capacity_changed.notify_one();
                     match msg {
                         OutMsg::Packet(pkt) => {
                             assert_eq!(pkt.msg_type, MsgType::Content);
@@ -1245,7 +1388,7 @@ mod tests {
                 assert_eq!(content, expected);
             };
             // Deliberately do not process ClientLive. Queue draining must
-            // progress even while mainloop is blocked inside fan_out.
+            // progress while PTY admission is paused.
             tokio::join!(writer, producer, receive, receive_live);
             assert!(matches!(
                 ctrl_rx.recv().await,
@@ -1274,12 +1417,14 @@ mod tests {
                 client(2, ClientState::Live, live_tx),
             ];
             let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
+            let capacity_changed = std::sync::Arc::new(Notify::new());
             let mut writer = Box::pin(tokio::task::unconstrained(writer_task(
                 1,
                 write,
                 vec![b'R'; 1024 * 1024],
                 out_rx,
                 ctrl_tx,
+                capacity_changed.clone(),
             )));
             assert!(poll_once(writer.as_mut()).await.is_pending());
             let expected: Vec<u8> = (0..OUTBOUND_CAP + 2)
@@ -1291,7 +1436,7 @@ mod tests {
                 })
                 .collect();
             let mut producer = Box::pin(tokio::task::unconstrained(async {
-                fan_out(&clients, &expected).await;
+                fan_out(&clients, &expected, &capacity_changed).await;
                 clients[1].out_tx.send(OutMsg::Shutdown).await.unwrap();
             }));
             assert!(poll_once(producer.as_mut()).await.is_pending());
@@ -1303,6 +1448,7 @@ mod tests {
             let receive_live = async {
                 let mut content = Vec::new();
                 while let Some(msg) = live_rx.recv().await {
+                    capacity_changed.notify_one();
                     match msg {
                         OutMsg::Packet(pkt) => {
                             assert_eq!(pkt.msg_type, MsgType::Content);
@@ -1333,7 +1479,15 @@ mod tests {
             let (out_tx, out_rx) = mpsc::channel(OUTBOUND_CAP);
             let clients = vec![client(1, ClientState::Replaying, out_tx)];
             let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel();
-            let writer = tokio::spawn(writer_task(1, write, Vec::new(), out_rx, ctrl_tx));
+            let capacity_changed = std::sync::Arc::new(Notify::new());
+            let writer = tokio::spawn(writer_task(
+                1,
+                write,
+                Vec::new(),
+                out_rx,
+                ctrl_tx,
+                capacity_changed.clone(),
+            ));
             // ReplayEnd is on the wire, but mainloop has not handled ClientLive.
             assert_eq!(
                 recv_packet(&mut peer).await.unwrap().msg_type,
@@ -1344,7 +1498,7 @@ mod tests {
                 Some(ControlMsg::ClientLive { id: 1 })
             ));
             assert_eq!(clients[0].state, ClientState::Replaying);
-            fan_out(&clients, b"SEQ:0000:SEQ:0001:").await;
+            fan_out(&clients, b"SEQ:0000:SEQ:0001:", &capacity_changed).await;
             clients[0].out_tx.send(OutMsg::Shutdown).await.unwrap();
             writer.await.unwrap();
             let pkt = recv_packet(&mut peer).await.unwrap();
