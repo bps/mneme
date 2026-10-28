@@ -292,8 +292,13 @@ async fn client_mainloop(
     // /dev/null and regular files can't be registered with kqueue; if
     // AsyncFd refuses, treat stdin as immediately at EOF so we just
     // wait for the server (e.g. to drive child exit through to the end).
-    let stdin_async = AsyncFd::with_interest(StdioFd(stdin_fd), Interest::READABLE).ok();
-    let stdout_async = AsyncFd::with_interest(StdioFd(stdout_fd), Interest::WRITABLE).ok();
+    // SAFETY: StdioFd always returns the same fd. The client does not close or
+    // replace stdin or stdout while these AsyncFd registrations are alive.
+    let stdin_async =
+        unsafe { AsyncFd::register_with_interest(StdioFd(stdin_fd), Interest::READABLE) }.ok();
+    // SAFETY: The same stdio lifetime guarantee applies to stdout.
+    let stdout_async =
+        unsafe { AsyncFd::register_with_interest(StdioFd(stdout_fd), Interest::WRITABLE) }.ok();
 
     let stdin_is_tty = rustix::termios::isatty(unsafe { BorrowedFd::borrow_raw(stdin_fd) });
     let mut stdin_eof = stdin_async.is_none();

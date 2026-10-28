@@ -1,6 +1,6 @@
 [package]
 name = "mneme"
-version = "0.1.0"
+version = "0.9.1"
 edition = "2024"
 license = "MIT"
 
@@ -8,13 +8,16 @@ license = "MIT"
 name = "mn"
 path = "src/main.rs"
 
+[lints.rust]
+warnings = "deny"
+
 [dependencies]
 bitflags = "2.11.1"
 clap = { version = "4.6.0", features = ["derive"] }
 clap_complete = { version = "4.6.2", features = ["unstable-dynamic"] }
 libc = "0.2.185"
 rustix = { version = "1.1.4", features = ["pty", "termios", "process", "fs", "net", "event", "pipe"] }
-tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "process", "signal", "time", "sync"] }
+tokio = { version = "1.54.1", features = ["rt", "macros", "net", "io-util", "process", "signal", "time", "sync"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

@@ -330,8 +330,12 @@ fn run_server_inner(
             // PTY leader must be non-blocking for AsyncFd.
             set_nonblocking(&leader_fd)?;
             let leader = std::sync::Arc::new(
-                AsyncFd::with_interest(leader_fd, Interest::READABLE | Interest::WRITABLE)
-                    .map_err(|e| format!("AsyncFd PTY: {e}"))?,
+                // SAFETY: AsyncFd owns the OwnedFd, which keeps the same valid
+                // PTY descriptor open until the registration is dropped.
+                unsafe {
+                    AsyncFd::register_with_interest(leader_fd, Interest::READABLE | Interest::WRITABLE)
+                }
+                .map_err(|e| format!("AsyncFd PTY: {e}"))?,
             );
 
             let listener = UnixListener::from_std(std_listener)?;

@@ -36,7 +36,9 @@ async fn retained_slave_produces_explicit_error_not_successful_exit() {
         let listener = UnixListener::bind(&path).unwrap();
         let (master, slave) = open_pty().unwrap();
         set_nonblocking(&master).unwrap();
-        let leader = std::sync::Arc::new(AsyncFd::new(master).unwrap());
+        // SAFETY: AsyncFd owns master, keeping its valid PTY descriptor open
+        // and unchanged until the registration is dropped.
+        let leader = std::sync::Arc::new(unsafe { AsyncFd::register(master) }.unwrap());
         // This child does not own the slave or make it a controlling terminal.
         // Our retained slave therefore survives its exit on Linux and Darwin.
         let mut signal =
