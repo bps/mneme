@@ -1,7 +1,7 @@
 //! PTY backpressure tests.
 //!
 //! With PTY-side backpressure (the server stops reading the PTY when
-//! any live client's userspace outbound is full), slow clients are no
+//! any registered client's userspace outbound is full), slow clients are no
 //! longer dropped. Instead the producer — the child process behind the
 //! PTY — blocks on its writes, which throttles every reader at once.
 //!
@@ -15,6 +15,7 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
@@ -59,6 +60,7 @@ fn start_session(prefix: &str, shell_cmd: &str) -> (TempDir, String, u32) {
 fn query_pid(socket: &Path) -> Option<u32> {
     let s = UnixStream::connect(socket).ok()?;
     s.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
+    s.set_write_timeout(Some(Duration::from_secs(1))).ok()?;
     let hello = mneme::protocol::Hello {
         version: mneme::protocol::PROTOCOL_VERSION,
         intent: mneme::protocol::Intent::Query,
@@ -67,13 +69,31 @@ fn query_pid(socket: &Path) -> Option<u32> {
         cols: 0,
     };
     mneme::protocol::send_packet(s.as_fd(), &mneme::protocol::Packet::hello(&hello)).ok()?;
-    let pkt = mneme::protocol::recv_packet(s.as_fd()).ok()?;
+    let pkt = recv_packet(&s).ok()?;
     pkt.parse_welcome().map(|w| w.server_pid)
+}
+
+// Use std's bounded read_exact here: the protocol fd helper retries EAGAIN
+// after partial reads, which can otherwise outlive SO_RCVTIMEO indefinitely.
+fn recv_packet(mut s: &UnixStream) -> std::io::Result<mneme::protocol::Packet> {
+    use mneme::protocol::{HEADER_SIZE, MAX_PAYLOAD, MsgType, Packet};
+    let mut header = [0; HEADER_SIZE];
+    s.read_exact(&mut header)?;
+    let msg_type =
+        MsgType::from_u8(header[0]).ok_or_else(|| std::io::Error::other("unknown message type"))?;
+    let len = u16::from_le_bytes([header[1], header[2]]) as usize;
+    if len > MAX_PAYLOAD {
+        return Err(std::io::Error::other("payload too large"));
+    }
+    let mut payload = vec![0; len];
+    s.read_exact(&mut payload)?;
+    Ok(Packet::new(msg_type, payload))
 }
 
 fn attach_raw(socket: &Path) -> UnixStream {
     let s = UnixStream::connect(socket).expect("connect");
-    s.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
 
     let hello = mneme::protocol::Hello {
         version: mneme::protocol::PROTOCOL_VERSION,
@@ -83,8 +103,13 @@ fn attach_raw(socket: &Path) -> UnixStream {
         cols: 80,
     };
     mneme::protocol::send_packet(s.as_fd(), &mneme::protocol::Packet::hello(&hello)).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let pkt = mneme::protocol::recv_packet(s.as_fd()).unwrap();
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .expect("attach handshake exceeded deadline");
+        s.set_read_timeout(Some(remaining)).unwrap();
+        let pkt = recv_packet(&s).unwrap();
         if pkt.msg_type == mneme::protocol::MsgType::ReplayEnd {
             break;
         }
@@ -166,41 +191,55 @@ fn slow_client_throttles_fast_client() {
     let (dir, session, pid) = start_session("throttle", FLOOD_CMD);
     let socket = dir.path().join(&session);
 
-    // Fast client first so its initial replay is small.
     let fast = attach_raw(&socket);
-    let slow = attach_raw(&socket);
+    fast.set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let bytes = AtomicU64::new(0);
+    let stop = AtomicBool::new(false);
+    let (slow, baseline_bytes, throttled_bytes) = std::thread::scope(|scope| {
+        // Drain continuously, including while the other client handshakes.
+        // Otherwise lossless replay can fill fast's queue and prevent the
+        // mainloop from registering slow at all.
+        let drain = scope.spawn(|| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut buf = [0u8; 8192];
+            while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                match (&fast).read(&mut buf) {
+                    Ok(0) => panic!("fast client disconnected while draining"),
+                    Ok(n) => {
+                        bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(e) => panic!("fast client read failed: {e}"),
+                }
+            }
+        });
 
-    // Baseline: drain fast for 500 ms with no slow-client interference yet
-    // (slow's outbound hasn't filled). Measure throughput.
-    fast.set_read_timeout(Some(Duration::from_millis(50))).ok();
-    let mut buf = [0u8; 8192];
-    let baseline_start = Instant::now();
-    let mut baseline_bytes: u64 = 0;
-    while baseline_start.elapsed() < Duration::from_millis(500) {
-        match (&fast).read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => baseline_bytes += n as u64,
-        }
-    }
+        // A genuine fast-only baseline: slow has not attached yet.
+        let start = bytes.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(500));
+        let baseline = bytes.load(Ordering::Relaxed) - start;
+        let slow = attach_raw(&socket);
 
-    // Now wait for slow's outbound to fill (gives time for kernel SNDBUF
-    // + userspace buffer to saturate; once full, PTY backpressure kicks
-    // in and fast is throttled too).
-    std::thread::sleep(Duration::from_secs(1));
+        // Let slow's kernel socket and bounded outbound queue fill while
+        // fast continues draining, then measure the throttled throughput.
+        std::thread::sleep(Duration::from_secs(1));
+        let start = bytes.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(500));
+        let throttled = bytes.load(Ordering::Relaxed) - start;
+        stop.store(true, Ordering::Relaxed);
+        drain.join().unwrap();
+        (slow, baseline, throttled)
+    });
 
-    // Measure fast's throughput while slow is stalled.
-    let throttled_start = Instant::now();
-    let mut throttled_bytes: u64 = 0;
-    while throttled_start.elapsed() < Duration::from_millis(500) {
-        match (&fast).read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => throttled_bytes += n as u64,
-        }
-    }
-
-    // The fast client should still be receiving SOMETHING (slow draining
-    // through kernel buffer is still happening), but throughput should be
-    // dramatically lower than baseline once PTY is paused.
+    assert!(baseline_bytes > 0, "fast-only baseline received no output");
+    // Once slow stops draining, throughput must drop dramatically.
     assert!(
         throttled_bytes < baseline_bytes / 4,
         "fast client wasn't throttled by slow client: baseline={baseline_bytes} \
@@ -282,7 +321,12 @@ fn large_startup_burst_does_not_drop_attached_client() {
     let socket = dir.path().join(&session);
 
     let stream = UnixStream::connect(&socket).expect("connect");
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     let hello = mneme::protocol::Hello {
         version: mneme::protocol::PROTOCOL_VERSION,
         intent: mneme::protocol::Intent::Attach,
@@ -301,7 +345,7 @@ fn large_startup_burst_does_not_drop_attached_client() {
     let mut received = 0usize;
     let mut got_exit = false;
     let mut got_replay_end = false;
-    while let Ok(pkt) = mneme::protocol::recv_packet(stream.as_fd()) {
+    while let Ok(pkt) = recv_packet(&stream) {
         match pkt.msg_type {
             mneme::protocol::MsgType::Welcome => {}
             mneme::protocol::MsgType::Replay => received += pkt.payload.len(),
