@@ -35,7 +35,10 @@ struct Session {
 
 impl Session {
     fn start(shell: &str, script: &str) -> Self {
-        let dir = TempDir::new().unwrap();
+        let dir = tempfile::Builder::new()
+            .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .tempdir()
+            .unwrap();
         let (mut ready, notify) = UnixStream::pair().unwrap();
         ready.set_read_timeout(Some(DEADLINE)).unwrap();
         let notify_fd = notify.as_raw_fd();
@@ -231,7 +234,10 @@ fn detach_and_server_hup_preserve_running_session() {
 
 #[test]
 fn term_reaches_signal_resistant_active_foreground_group() {
-    let dir = TempDir::new().unwrap();
+    let dir = tempfile::Builder::new()
+        .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .tempdir()
+        .unwrap();
     let script_path = dir.path().join("foreground.sh");
     std::fs::write(
         &script_path,
