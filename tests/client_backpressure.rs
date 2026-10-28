@@ -431,7 +431,9 @@ fn busy_tty_receives_complete_reset_when_output_resumes_promptly() {
     // Keep the terminal busy briefly, then resume while cleanup's bounded
     // retry is still active. A single best-effort reset write loses these bytes.
     std::thread::sleep(Duration::from_millis(50));
-    let reset = b"\x1b[?1049l\x1b[<u\x1b[0m\x1b[?25h\x1b[?7h\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[r\r\n";
+    // Cleanup must reach the bottom row before its final newline, so status
+    // messages cannot appear above stale TUI content.
+    let reset = b"\x1b[?1049l\x1b[<u\x1b[0m\x1b[?25h\x1b[?7h\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[r\x1b[9999;1H\r\n";
     let mut bytes = Vec::new();
     let mut buf = [0; 8192];
     until(|| {

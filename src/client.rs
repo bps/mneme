@@ -182,7 +182,9 @@ impl Drop for RawTerminal {
         let stdout = io::stdout();
         // Give a busy terminal a short opportunity to accept the reset, but
         // never wait indefinitely for stopped output. Keep partial-write state.
-        let mut reset = b"\x1b[?1049l\x1b[<u\x1b[0m\x1b[?25h\x1b[?7h\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[r\r\n".as_slice();
+        // CUP clamps to the last row. Move there after resetting the scroll
+        // region, then scroll a clean line for the exit message and shell prompt.
+        let mut reset = b"\x1b[?1049l\x1b[<u\x1b[0m\x1b[?25h\x1b[?7h\x1b[?2004l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[r\x1b[9999;1H\r\n".as_slice();
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
         while !reset.is_empty() {
             let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
