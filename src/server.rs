@@ -12,9 +12,9 @@
 //!        writer tasks send events on.
 //!
 //!  - **Intake task** (one per accepted connection): reads the `Hello`
-//!    packet, validates protocol version + peer UID, sends `Welcome`.
-//!    On `Query` intent, exits. On `Attach`, forwards
-//!    `ControlMsg::Register{stream, hello}` to the main task.
+//!    packet, validates protocol version + peer UID, then forwards
+//!    `ControlMsg::Hello{stream, hello}` to the main task. The main task
+//!    supplies authoritative `Welcome` metadata without registering queries.
 //!
 //!  - **Per-client writer task**: owns the write half of the socket and a
 //!    bounded `mpsc::Receiver<OutMsg>`. On startup it sends the ring
@@ -611,8 +611,8 @@ impl ClientHandle {
 }
 
 enum ControlMsg {
-    /// Intake task finished handshake and the client wants to attach.
-    Register {
+    /// Intake validated Hello; mainloop decides whether to query or attach.
+    Hello {
         stream: tokio::net::UnixStream,
         hello: Hello,
     },
@@ -852,7 +852,7 @@ async fn mainloop(
                         };
                         // Spawn intake. It owns the stream until handshake done.
                         let ctx = ctrl_tx.clone();
-                        tasks.spawn(intake_task(stream, ctx, child_running, exit_status, ring.capacity() as u32, ring.len() as u32));
+                        tasks.spawn(intake_task(stream, ctx));
                     }
                     Err(e) => eprintln!("[mn-srv] accept: {e}"),
                 }
@@ -861,13 +861,33 @@ async fn mainloop(
             // Control events from intake / reader / writer tasks --------
             Some(msg) = ctrl_rx.recv() => {
                 match msg {
-                    ControlMsg::Register { stream, hello } => {
+                    ControlMsg::Hello { mut stream, hello } => {
+                        let attaching = hello.intent == Intent::Attach;
+                        let welcome = Packet::welcome(&protocol::Welcome {
+                            version: PROTOCOL_VERSION,
+                            server_pid: std::process::id(),
+                            child_pid,
+                            child_running,
+                            exit_status: exit_status.unwrap_or(0) as u8,
+                            // Attach includes its new registration, even during replay.
+                            client_count: u16::try_from(clients.len() + usize::from(attaching)).unwrap_or(u16::MAX),
+                            ring_size: ring.capacity() as u32,
+                            ring_used: ring.len() as u32,
+                        });
+                        if !attaching {
+                            // Queries neither register nor elect a controller. Socket I/O
+                            // stays outside mainloop so an unresponsive peer cannot stall it.
+                            tasks.spawn(async move {
+                                let _ = tokio::time::timeout(HELLO_TIMEOUT, send_packet(&mut stream, &welcome)).await;
+                            });
+                            continue;
+                        }
                         let id = next_id; next_id += 1;
                         // Snapshot and registration have no intervening await:
                         // subsequent PTY bytes go into this client's queue.
                         let snapshot = ring.snapshot();
                         let (out_tx, out_rx) = mpsc::channel::<OutMsg>(OUTBOUND_CAP);
-                        let (read_half, write_half) = stream.into_split();
+                        let (read_half, mut write_half) = stream.into_split();
                         clients.push(ClientHandle {
                             id,
                             flags: hello.flags,
@@ -879,7 +899,20 @@ async fn mainloop(
                             shutdown_pending: terminal.is_some(),
                             drain_deadline: (!child_running).then(|| tokio::time::Instant::now() + CLIENT_DRAIN_TIMEOUT),
                             tasks: vec![
-                                tasks.spawn(writer_task(id, write_half, snapshot, out_rx, ctrl_tx.clone(), capacity_changed.clone())),
+                                tasks.spawn({
+                                    let ctrl_tx = ctrl_tx.clone();
+                                    let capacity_changed = capacity_changed.clone();
+                                    async move {
+                                        if !matches!(
+                                            tokio::time::timeout(HELLO_TIMEOUT, send_packet(&mut write_half, &welcome)).await,
+                                            Ok(Ok(()))
+                                        ) {
+                                            let _ = ctrl_tx.send(ControlMsg::ClientGone { id });
+                                            return;
+                                        }
+                                        writer_task(id, write_half, snapshot, out_rx, ctrl_tx, capacity_changed).await;
+                                    }
+                                }),
                                 tasks.spawn(reader_task(id, read_half, ctrl_tx.clone(), leader.clone(), pty_write_lock.clone(), hello.flags)),
                             ],
                         });
@@ -1025,16 +1058,12 @@ fn elect_controller(clients: &mut [ClientHandle]) {
 }
 
 // ---------------------------------------------------------------------------
-// Intake task — reads Hello, writes Welcome
+// Intake task — validates Hello before requesting authoritative metadata
 // ---------------------------------------------------------------------------
 
 async fn intake_task(
     mut stream: tokio::net::UnixStream,
     ctrl_tx: mpsc::UnboundedSender<ControlMsg>,
-    child_running: bool,
-    exit_status: Option<u32>,
-    ring_size: u32,
-    ring_used: u32,
 ) {
     // Bounded handshake time so a malicious or stuck peer can't hold a
     // connection slot forever.
@@ -1059,31 +1088,14 @@ async fn intake_task(
             return Err(io::Error::other("version mismatch"));
         }
 
-        let welcome = protocol::Welcome {
-            version: PROTOCOL_VERSION,
-            server_pid: std::process::id(),
-            child_pid: 0,
-            child_running,
-            exit_status: exit_status.unwrap_or(0) as u8,
-            client_count: 0,
-            ring_size,
-            ring_used,
-        };
-        send_packet(&mut stream, &Packet::welcome(&welcome)).await?;
-
         Ok::<_, io::Error>(hello)
     })
     .await;
 
     match res {
-        Ok(Ok(hello)) => match hello.intent {
-            Intent::Query => {
-                // Drop after Welcome.
-            }
-            Intent::Attach => {
-                let _ = ctrl_tx.send(ControlMsg::Register { stream, hello });
-            }
-        },
+        Ok(Ok(hello)) => {
+            let _ = ctrl_tx.send(ControlMsg::Hello { stream, hello });
+        }
         Ok(Err(e)) => eprintln!("[mn-srv] intake error: {e}"),
         Err(_) => eprintln!("[mn-srv] intake timed out"),
     }

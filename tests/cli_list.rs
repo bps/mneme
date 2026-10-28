@@ -214,12 +214,7 @@ fn list_marks_idle_session_with_blank() {
     );
 }
 
-// The server currently hard-codes `client_count: 0` in Welcome
-// (see src/server.rs — "TODO: accurate count"), so the `*` marker is
-// unreachable until that is implemented. Marked #[ignore] so the test
-// is preserved and trivially flips back on once the server tracks it.
 #[test]
-#[ignore = "blocked on server reporting accurate client_count in Welcome"]
 fn list_marks_attached_session_with_star() {
     let env = Env::new();
     let sess = env.session("ls-attached");
