@@ -12,6 +12,21 @@ use tempfile::TempDir;
 const LIMIT: Duration = Duration::from_secs(12);
 const BLOCKS: usize = 256;
 
+// Unlike the fd protocol helper, do not retry partial-packet EAGAIN forever.
+fn recv_packet(mut stream: &UnixStream) -> std::io::Result<Packet> {
+    let mut header = [0; protocol::HEADER_SIZE];
+    stream.read_exact(&mut header)?;
+    let kind =
+        MsgType::from_u8(header[0]).ok_or_else(|| std::io::Error::other("unknown packet type"))?;
+    let len = u16::from_le_bytes([header[1], header[2]]) as usize;
+    if len > protocol::MAX_PAYLOAD {
+        return Err(std::io::Error::other("oversized packet"));
+    }
+    let mut payload = vec![0; len];
+    stream.read_exact(&mut payload)?;
+    Ok(Packet::new(kind, payload))
+}
+
 struct Session {
     child: Child,
     dir: TempDir,
@@ -75,10 +90,7 @@ impl Session {
             }),
         )
         .unwrap();
-        assert_eq!(
-            protocol::recv_packet(stream.as_fd()).unwrap().msg_type,
-            MsgType::Welcome
-        );
+        assert_eq!(recv_packet(&stream).unwrap().msg_type, MsgType::Welcome);
         stream
     }
 
@@ -98,10 +110,7 @@ impl Session {
             }),
         )
         .unwrap();
-        protocol::recv_packet(stream.as_fd())
-            .unwrap()
-            .parse_welcome()
-            .unwrap()
+        recv_packet(&stream).unwrap().parse_welcome().unwrap()
     }
 
     fn release(&self) {
@@ -123,14 +132,6 @@ impl Session {
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // Only the fixture's explicitly published detached holder is targeted.
-        if let Ok(pid) = std::fs::read_to_string(self.dir.path().join("holder")) {
-            if let Ok(pid) = pid.trim().parse::<i32>() {
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                }
-            }
-        }
         if self.child.try_wait().ok().flatten().is_none() {
             unsafe {
                 libc::kill(self.child.id() as i32, libc::SIGCONT);
@@ -153,7 +154,7 @@ fn collect(stream: &UnixStream, mut bytes: Vec<u8>, mut replay_end: bool) -> Vec
     let deadline = Instant::now() + LIMIT;
     loop {
         assert!(Instant::now() < deadline, "no terminal status");
-        let packet = protocol::recv_packet(stream.as_fd()).unwrap();
+        let packet = recv_packet(stream).unwrap();
         match packet.msg_type {
             MsgType::Replay => {
                 assert!(!replay_end);
@@ -171,7 +172,7 @@ fn collect(stream: &UnixStream, mut bytes: Vec<u8>, mut replay_end: bool) -> Vec
                 assert!(replay_end);
                 assert_eq!(packet.parse_exit_status(), Some(37));
                 assert_eq!(
-                    protocol::recv_packet(stream.as_fd()).unwrap_err().kind(),
+                    recv_packet(stream).unwrap_err().kind(),
                     std::io::ErrorKind::UnexpectedEof,
                     "socket must close immediately after Exit"
                 );
@@ -193,10 +194,7 @@ exit 37
 "#,
     );
     let stream = session.connect(Intent::Attach);
-    assert_eq!(
-        protocol::recv_packet(stream.as_fd()).unwrap().msg_type,
-        MsgType::ReplayEnd
-    );
+    assert_eq!(recv_packet(&stream).unwrap().msg_type, MsgType::ReplayEnd);
     // Stop only this fixture server. The child can finish while the mainloop
     // cannot read: both SIGCHLD and the final PTY bytes are ready on resume.
     assert_eq!(
@@ -251,10 +249,7 @@ fn expected() -> Vec<u8> {
 fn live_burst_tail_precedes_exit_and_socket_close() {
     let mut session = Session::start(BURST);
     let stream = session.connect(Intent::Attach);
-    assert_eq!(
-        protocol::recv_packet(stream.as_fd()).unwrap().msg_type,
-        MsgType::ReplayEnd
-    );
+    assert_eq!(recv_packet(&stream).unwrap().msg_type, MsgType::ReplayEnd);
     session.release();
     assert_eq!(collect(&stream, Vec::new(), true), expected());
     session.wait(true);
@@ -292,7 +287,7 @@ exit 37
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    while let Ok(packet) = protocol::recv_packet(stream.as_fd()) {
+    while let Ok(packet) = recv_packet(&stream) {
         assert_ne!(
             packet.msg_type,
             MsgType::Exit,
@@ -304,6 +299,29 @@ exit 37
     let retry = session.connect(Intent::Attach);
     assert_eq!(collect(&retry, Vec::new(), false), expected());
     session.wait(true);
+}
+
+#[test]
+fn explicit_shutdown_bounds_an_exited_sessions_blocked_replay() {
+    let mut session = Session::start(BURST);
+    session.release();
+    let deadline = Instant::now() + LIMIT;
+    while session.query().child_running {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let stream = session.connect(Intent::Attach);
+    let start = Instant::now();
+    assert_eq!(
+        unsafe { libc::kill(session.child.id() as i32, libc::SIGTERM) },
+        0
+    );
+    session.wait(true);
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "shutdown exceeded CLI kill deadline"
+    );
+    drop(stream);
 }
 
 #[test]
@@ -326,10 +344,7 @@ fn late_attach_receives_entire_burst_before_status() {
             }),
         )
         .unwrap();
-        let welcome = protocol::recv_packet(stream.as_fd())
-            .unwrap()
-            .parse_welcome()
-            .unwrap();
+        let welcome = recv_packet(&stream).unwrap().parse_welcome().unwrap();
         if !welcome.child_running {
             break;
         }

@@ -59,6 +59,8 @@ const OUTBOUND_CAP: usize = 64;
 const READ_BUF_SIZE: usize = 4096;
 const READ_PACKETS: usize = READ_BUF_SIZE.div_ceil(MAX_PAYLOAD);
 const CLIENT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+// Pause the PTY EOF deadline under backpressure; client deadlines bound that pause.
+const PTY_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 // Leave headroom for the CLI's two-second lock-release deadline.
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(300);
@@ -552,7 +554,7 @@ struct ClientHandle {
     out_tx: mpsc::Sender<OutMsg>,
     // Coalesced control state stays bounded even if the outbound queue is full.
     resize_pending: bool,
-    exit_pending: Option<u32>,
+    terminal_pending: Option<Packet>,
     shutdown_pending: bool,
     drain_deadline: Option<tokio::time::Instant>,
     tasks: Vec<tokio::task::AbortHandle>,
@@ -568,7 +570,16 @@ impl Drop for ClientHandle {
 
 impl ClientHandle {
     fn controls_pending(&self) -> bool {
-        self.resize_pending || self.exit_pending.is_some() || self.shutdown_pending
+        self.resize_pending || self.terminal_pending.is_some() || self.shutdown_pending
+    }
+
+    fn finish(&mut self, packet: Packet, now: tokio::time::Instant) {
+        // This slot is independent of the bounded content channel. Flush it
+        // behind all accepted output, then close; never await a slow socket.
+        self.resize_pending = false;
+        self.terminal_pending = Some(packet);
+        self.shutdown_pending = true;
+        self.drain_deadline = Some(now + CLIENT_DRAIN_TIMEOUT);
     }
 
     fn flush_controls(&mut self) {
@@ -582,15 +593,15 @@ impl ClientHandle {
             }
             self.resize_pending = false;
         }
-        if let Some(status) = self.exit_pending {
+        if let Some(packet) = self.terminal_pending.as_ref() {
             if self
                 .out_tx
-                .try_send(OutMsg::Packet(Packet::exit(status)))
+                .try_send(OutMsg::Packet(packet.clone()))
                 .is_err()
             {
                 return;
             }
-            self.exit_pending = None;
+            self.terminal_pending = None;
         }
         if self.shutdown_pending && self.out_tx.try_send(OutMsg::Shutdown).is_ok() {
             self.shutdown_pending = false;
@@ -606,6 +617,8 @@ enum ControlMsg {
     },
     /// Writer task finished sending the replay; client transitions to Live.
     ClientLive { id: u64 },
+    /// Writer flushed the terminal result and shut down its write half.
+    ClientFinished,
     /// Reader task: client requested a resize.
     Resize { id: u64, rows: u16, cols: u16 },
     /// Reader task: client requested disconnect.
@@ -627,6 +640,8 @@ async fn mainloop(
     reporter: &mut crate::startup::Reporter,
 ) -> Result<(), crate::Error> {
     let child_pid = child.id().unwrap_or(0);
+    let mut child = Some(child);
+    let mut cleanup = None;
     // Cancellation must close client-owned PTY clones as well as sockets.
     let mut tasks = tokio::task::JoinSet::new();
     let mut ring = RingBuffer::new(ring_size);
@@ -635,6 +650,11 @@ async fn mainloop(
     let mut child_running = true;
     let mut exit_status: Option<u32> = None;
     let mut exit_notified = false;
+    let mut terminal: Option<Packet> = None;
+    let mut drain_failure: Option<String> = None;
+    let mut pty_deadline = None;
+    let mut pty_budget = PTY_DRAIN_TIMEOUT;
+    let mut pty_clock = None;
     // On Linux, reading the PTY master after the slave has closed returns
     // EIO (vs. macOS returning 0). Either way, once we've seen EOF we must
     // stop polling the readable arm — otherwise AsyncFd keeps reporting
@@ -659,8 +679,9 @@ async fn mainloop(
     reporter.success()?;
 
     loop {
-        // Termination condition: child gone, every client notified+drained.
-        if !child_running && clients.is_empty() && exit_notified {
+        // A queued Exit is not notification. Preserve output for retries
+        // unless a writer confirmed the result, and finish group cleanup.
+        if terminal.is_some() && clients.is_empty() && exit_notified && cleanup.is_none() {
             eprintln!("[mn-srv] mainloop exit: child_gone+no_clients+notified");
             break;
         }
@@ -670,17 +691,43 @@ async fn mainloop(
         clients.retain(|c| {
             let expired = c.drain_deadline.is_some_and(|deadline| deadline <= now);
             if expired {
-                eprintln!("[mn-srv] client {} exceeded exit drain deadline", c.id);
+                eprintln!("[mn-srv] client {} disconnected with undelivered output: exit drain deadline exceeded", c.id);
             }
             !expired
         });
-        if clients.len() != before {
+        if clients.len() != before && child_running {
             elect_controller(&mut clients);
+        }
+        if !child_running && terminal.is_none() {
+            if !pty_eof {
+                pty_deadline =
+                    drain_deadline(&mut pty_budget, &mut pty_clock, now, output_ready(&clients));
+                if pty_deadline.is_some_and(|deadline| now >= deadline) {
+                    let error = "final output incomplete: timed out waiting for PTY EOF (inherited slave descriptor)";
+                    eprintln!("[mn-srv] {error}");
+                    drain_failure = Some(error.into());
+                    pty_eof = true;
+                }
+            }
+            if pty_eof {
+                terminal = Some(match &drain_failure {
+                    Some(error) => Packet::error(error),
+                    None => Packet::exit(exit_status.expect("observed child status")),
+                });
+                pty_deadline = None;
+                for c in &mut clients {
+                    c.finish(terminal.as_ref().unwrap().clone(), now);
+                }
+            }
         }
         for c in &mut clients {
             c.flush_controls();
         }
-        let drain_deadline = clients.iter().filter_map(|c| c.drain_deadline).min();
+        let drain_deadline = clients
+            .iter()
+            .filter_map(|c| c.drain_deadline)
+            .chain(pty_deadline)
+            .min();
         // Mainloop is the only sender. With no await between this capacity
         // check and fan-out, a read cannot overrun any client's bounded queue.
         let output_ready = output_ready(&clients);
@@ -698,35 +745,37 @@ async fn mainloop(
             // Do not retain completed task handles in long-lived sessions.
             _ = tasks.join_next(), if !tasks.is_empty() => {}
 
+            result = async { cleanup.as_mut().unwrap().await }, if cleanup.is_some() => {
+                cleanup = None;
+                result?;
+            }
+
             // Child exit ------------------------------------------------
             res = observe_child_exit(child_pid, child_exit), if child_running => {
                 let status = res?;
-                // End the managed groups before reaping, while the child's PID
-                // still reserves the session/group identity. Exited sessions
-                // can then retain output indefinitely without stale PID kills.
-                if let Err(error) = shutdown_child(child, foreground_group(leader.get_ref())).await {
-                    if child.id().is_some() {
-                        return Err(error);
+                // Retain WNOWAIT's reserved identity until group cleanup
+                // finishes, but poll its grace/reap waits alongside PTY reads
+                // and controls. Cancellation leaves outer shutdown responsible.
+                let child = child.take().expect("cleanup starts once");
+                let foreground = foreground_group(leader.get_ref());
+                cleanup = Some(Box::pin(async move {
+                    if let Err(error) = shutdown_child(child, foreground).await {
+                        if child.id().is_some() {
+                            return Err(error);
+                        }
+                        eprintln!("[mn-srv] group cleanup: {error}");
                     }
-                    // A signal error must not discard retained output/status
-                    // after the direct child has been successfully reaped.
-                    eprintln!("[mn-srv] group cleanup: {error}");
-                }
+                    Ok::<_, crate::Error>(())
+                }));
                 child_running = false;
                 exit_status = Some(status);
                 eprintln!("[mn-srv] child exited status={status} live_clients={}", clients.len());
+                let deadline = tokio::time::Instant::now() + CLIENT_DRAIN_TIMEOUT;
                 for c in &mut clients {
-                    if c.state == ClientState::Live {
-                        c.exit_pending = Some(status);
-                        c.drain_deadline = Some(tokio::time::Instant::now() + CLIENT_DRAIN_TIMEOUT);
-                        exit_notified = true;
-                    }
+                    c.drain_deadline = Some(deadline);
                 }
-                // Replaying clients will receive Exit when they transition
-                // to Live (see ClientLive handler). If there are zero
-                // clients at all, we KEEP the server running so a future
-                // attach can pick up the exit status — same behavior as
-                // the original poll-based server.
+                // No Exit yet: PTY EOF must follow the final accepted bytes.
+                // With no clients we retain the finalized snapshot and result.
             }
 
             // PTY readable ----------------------------------------------
@@ -736,7 +785,7 @@ async fn mainloop(
             guard = leader.readable(), if !pty_eof && output_ready => {
                 let mut guard = match guard {
                     Ok(g) => g,
-                    Err(_) => continue,
+                    Err(error) => return Err(io::Error::other(format!("PTY readiness failed; output may be incomplete: {error}")).into()),
                 };
                 match guard.try_io(|inner| {
                     let fd = inner.get_ref().as_fd();
@@ -769,7 +818,12 @@ async fn mainloop(
                         if e.raw_os_error() == Some(libc::EIO) {
                             pty_eof = true;
                         } else {
-                            eprintln!("[mn-srv] pty read err: {e}");
+                            if child_running {
+                                return Err(io::Error::other(format!("PTY read failed; output may be incomplete: {e}")).into());
+                            }
+                            drain_failure = Some(format!("final output incomplete: PTY read failed: {e}"));
+                            eprintln!("[mn-srv] {}", drain_failure.as_ref().unwrap());
+                            pty_eof = true;
                         }
                     }
                     Err(_would_block) => { /* try_io returns Err if ready was spurious; loop */ }
@@ -820,9 +874,9 @@ async fn mainloop(
                             is_controller: false,
                             out_tx,
                             resize_pending: false,
-                            exit_pending: None,
-                            shutdown_pending: false,
-                            drain_deadline: None,
+                            terminal_pending: terminal.clone(),
+                            shutdown_pending: terminal.is_some(),
+                            drain_deadline: (!child_running).then(|| tokio::time::Instant::now() + CLIENT_DRAIN_TIMEOUT),
                             tasks: vec![
                                 tasks.spawn(writer_task(id, write_half, snapshot, out_rx, ctrl_tx.clone(), capacity_changed.clone())),
                                 tasks.spawn(reader_task(id, read_half, ctrl_tx.clone(), leader.clone(), pty_write_lock.clone(), hello.flags)),
@@ -832,20 +886,15 @@ async fn mainloop(
                     ControlMsg::ClientLive { id } => {
                         if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
                             c.state = ClientState::Live;
-                            // If child already exited before this client became
-                            // Live, send Exit immediately so it doesn't hang.
-                            if !child_running && let Some(s) = exit_status {
-                                c.exit_pending = Some(s);
-                                c.shutdown_pending = true;
-                                c.drain_deadline = Some(tokio::time::Instant::now() + CLIENT_DRAIN_TIMEOUT);
-                                exit_notified = true;
+                            if child_running {
+                                elect_controller(&mut clients);
                             }
-                            elect_controller(&mut clients);
                         }
                     }
+                    ControlMsg::ClientFinished => exit_notified = true,
                     ControlMsg::Resize { id, rows, cols } => {
                         let is_ctrl = clients.iter().find(|c| c.id == id).map(|c| c.is_controller).unwrap_or(false);
-                        if is_ctrl {
+                        if is_ctrl && child_running {
                             let ws = rustix::termios::Winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
                             let _ = rustix::termios::tcsetwinsize(leader.get_ref(), ws);
                             if let Some(pgid) = rustix::process::Pid::from_raw(child_pid as i32) {
@@ -858,7 +907,9 @@ async fn mainloop(
                     ControlMsg::Detach { id } | ControlMsg::ClientGone { id } => {
                         if let Some(pos) = clients.iter().position(|c| c.id == id) {
                             clients.remove(pos);
-                            elect_controller(&mut clients);
+                            if child_running {
+                                elect_controller(&mut clients);
+                            }
                         }
                     }
                 }
@@ -866,7 +917,31 @@ async fn mainloop(
         }
     }
 
-    Ok(())
+    match drain_failure {
+        Some(error) => Err(io::Error::other(error).into()),
+        None => Ok(()),
+    }
+}
+
+// Charge only unblocked time, but never replenish the budget when a client
+// briefly fills its queue. Client deadlines independently bound blocked time.
+fn drain_deadline(
+    budget: &mut Duration,
+    active_since: &mut Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+    ready: bool,
+) -> Option<tokio::time::Instant> {
+    if let Some(since) = active_since.take() {
+        *budget = budget.saturating_sub(now - since);
+    }
+    if budget.is_zero() {
+        Some(now)
+    } else if ready {
+        *active_since = Some(now);
+        Some(now + *budget)
+    } else {
+        None
+    }
 }
 
 fn output_ready(clients: &[ClientHandle]) -> bool {
@@ -1054,6 +1129,7 @@ async fn writer_task(
         return;
     }
     // 3. Drain outbound channel.
+    let mut final_sent = false;
     while let Some(msg) = rx.recv().await {
         // notify_one stores a permit if mainloop is between its capacity
         // check and select, so a freed slot cannot cause a lost wakeup.
@@ -1066,12 +1142,15 @@ async fn writer_task(
                     let _ = ctrl_tx.send(ControlMsg::ClientGone { id });
                     return;
                 }
+                final_sent |= matches!(p.msg_type, MsgType::Exit | MsgType::Error);
             }
             OutMsg::Shutdown => break,
         }
     }
     // Graceful close: shut the write half so the client sees EOF.
-    let _ = w.shutdown().await;
+    if w.shutdown().await.is_ok() && final_sent {
+        let _ = ctrl_tx.send(ControlMsg::ClientFinished);
+    }
     let _ = ctrl_tx.send(ControlMsg::ClientGone { id });
 }
 
@@ -1175,6 +1254,10 @@ async fn recv_packet_half(r: &mut OwnedReadHalf) -> io::Result<Packet> {
 }
 
 #[cfg(test)]
+#[path = "server_exit_tests.rs"]
+mod exit_tests;
+
+#[cfg(test)]
 mod startup_tests {
     use super::*;
     use std::os::fd::IntoRawFd;
@@ -1240,7 +1323,7 @@ mod tests {
             is_controller: false,
             out_tx,
             resize_pending: false,
-            exit_pending: None,
+            terminal_pending: None,
             shutdown_pending: false,
             drain_deadline: None,
             tasks: Vec::new(),
@@ -1258,7 +1341,7 @@ mod tests {
                 .unwrap();
         }
         elect_controller(&mut clients);
-        clients[0].exit_pending = Some(7);
+        clients[0].terminal_pending = Some(Packet::exit(7));
         clients[0].shutdown_pending = true;
         clients[0].flush_controls();
         assert!(clients[0].is_controller);
